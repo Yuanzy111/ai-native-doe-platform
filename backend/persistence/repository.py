@@ -55,10 +55,21 @@ CREATE TABLE IF NOT EXISTS campaign_run (
 CREATE INDEX IF NOT EXISTS ix_run_definition
     ON campaign_run (campaign_definition_id);
 
+CREATE TABLE IF NOT EXISTS recommendation_batch (
+    id TEXT PRIMARY KEY,
+    campaign_run_id TEXT NOT NULL REFERENCES campaign_run (id),
+    round_number INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    UNIQUE (campaign_run_id, round_number)
+);
+CREATE INDEX IF NOT EXISTS ix_batch_run
+    ON recommendation_batch (campaign_run_id);
+
 CREATE TABLE IF NOT EXISTS experiment_round (
     id TEXT PRIMARY KEY,
     campaign_run_id TEXT NOT NULL REFERENCES campaign_run (id),
     round_number INTEGER NOT NULL,
+    recommendation_batch_id TEXT NOT NULL REFERENCES recommendation_batch (id),
     data TEXT NOT NULL,
     UNIQUE (campaign_run_id, round_number)
 );
@@ -86,16 +97,6 @@ CREATE TABLE IF NOT EXISTS measurement (
 );
 CREATE INDEX IF NOT EXISTS ix_measurement_experiment_run
     ON measurement (experiment_run_id);
-
-CREATE TABLE IF NOT EXISTS recommendation_batch (
-    id TEXT PRIMARY KEY,
-    campaign_run_id TEXT NOT NULL REFERENCES campaign_run (id),
-    round_number INTEGER NOT NULL,
-    data TEXT NOT NULL,
-    UNIQUE (campaign_run_id, round_number)
-);
-CREATE INDEX IF NOT EXISTS ix_batch_run
-    ON recommendation_batch (campaign_run_id);
 
 CREATE TABLE IF NOT EXISTS decision_log (
     id TEXT PRIMARY KEY,
@@ -194,12 +195,43 @@ class SqliteRepository:
     def _update(self, table: str, entity_id: str, row: dict[str, object]) -> None:
         """Update the columns of one existing row by id."""
         assignments = ", ".join(f"{column} = ?" for column in row)
-        cursor = self._conn.execute(
-            f"UPDATE {table} SET {assignments} WHERE id = ?",
-            (*row.values(), entity_id),
-        )
+        try:
+            cursor = self._conn.execute(
+                f"UPDATE {table} SET {assignments} WHERE id = ?",
+                (*row.values(), entity_id),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise PersistenceError(
+                f"Update of {table!r} violates a referential/uniqueness "
+                f"invariant: {exc}"
+            ) from exc
         if cursor.rowcount == 0:
             raise PersistenceError(f"No {table!r} row with id {entity_id!r} to update.")
+
+    def _guard_immutable(
+        self, table: str, entity_id: str, expected: dict[str, object]
+    ) -> None:
+        """Reject a save that would change a parent/ownership/identity column.
+
+        The extracted foreign-key columns must never drift from the JSON blob, so
+        a ``save_*`` is only allowed to touch the mutable state of a row. This
+        fetches the persisted values of the immutable columns and raises if the
+        incoming model disagrees, rather than silently rewriting the parent.
+        """
+        columns = ", ".join(expected)
+        row = self._conn.execute(
+            f"SELECT {columns} FROM {table} WHERE id = ?", (entity_id,)
+        ).fetchone()
+        if row is None:
+            raise PersistenceError(
+                f"No {table!r} row with id {entity_id!r} to update."
+            )
+        for column, value in expected.items():
+            if row[column] != value:
+                raise PersistenceError(
+                    f"{table}.{column} is immutable and cannot be changed from "
+                    f"{row[column]!r} to {value!r}."
+                )
 
     def _fetch_one(self, table: str, entity_id: str) -> sqlite3.Row | None:
         """Fetch one row by id, or ``None``."""
@@ -301,7 +333,27 @@ class SqliteRepository:
     # CampaignRun -----------------------------------------------------------
 
     def add_run(self, run: CampaignRun) -> None:
-        """Insert a new campaign run."""
+        """Insert a new campaign run, enforcing revision/campaign ownership.
+
+        The pinned revision must exist and belong to the run's campaign
+        definition; the database foreign keys alone cannot express that the
+        revision and the run agree on the owning campaign.
+
+        Raises:
+            PersistenceError: If the pinned revision is unknown or belongs to a
+                different campaign definition.
+        """
+        revision = self.get_revision(run.definition_revision_id)
+        if revision is None:
+            raise PersistenceError(
+                f"Run references unknown revision {run.definition_revision_id!r}."
+            )
+        if revision.campaign_definition_id != run.campaign_definition_id:
+            raise PersistenceError(
+                "The run's pinned revision must belong to the run's campaign "
+                f"definition {run.campaign_definition_id!r}, but revision "
+                f"{revision.id!r} belongs to {revision.campaign_definition_id!r}."
+            )
         self._insert(
             "campaign_run",
             {
@@ -314,7 +366,16 @@ class SqliteRepository:
         )
 
     def save_run(self, run: CampaignRun) -> None:
-        """Persist an updated run (status/round/budget changes)."""
+        """Persist an updated run (status/revision/counter changes).
+
+        ``campaignDefinitionId`` is the run's parent and is immutable; only the
+        pinned revision, status, and JSON state may change.
+        """
+        self._guard_immutable(
+            "campaign_run",
+            run.id,
+            {"campaign_definition_id": run.campaign_definition_id},
+        )
         self._update(
             "campaign_run",
             run.id,
@@ -341,26 +402,64 @@ class SqliteRepository:
     # ExperimentRound -------------------------------------------------------
 
     def add_round(self, experiment_round: ExperimentRound) -> None:
-        """Insert a new experiment round."""
+        """Insert a new experiment round, tying it to its recommendation batch.
+
+        The referenced batch must exist and agree with the round on both the
+        owning run and the round number, so a round can never point at a batch
+        from a different run or round.
+
+        Raises:
+            PersistenceError: If the batch is unknown, or its ``campaignRunId`` /
+                ``roundNumber`` disagree with the round.
+        """
+        batch = self.get_batch(experiment_round.recommendation_batch_id)
+        if batch is None:
+            raise PersistenceError(
+                "Round references unknown recommendation batch "
+                f"{experiment_round.recommendation_batch_id!r}."
+            )
+        if batch.campaign_run_id != experiment_round.campaign_run_id:
+            raise PersistenceError(
+                "A round and its recommendation batch must belong to the same "
+                f"run: round on {experiment_round.campaign_run_id!r}, batch on "
+                f"{batch.campaign_run_id!r}."
+            )
+        if batch.round_number != experiment_round.round_number:
+            raise PersistenceError(
+                "A round and its recommendation batch must share a roundNumber: "
+                f"round {experiment_round.round_number}, batch "
+                f"{batch.round_number}."
+            )
         self._insert(
             "experiment_round",
             {
                 "id": experiment_round.id,
                 "campaign_run_id": experiment_round.campaign_run_id,
                 "round_number": experiment_round.round_number,
+                "recommendation_batch_id": experiment_round.recommendation_batch_id,
                 "data": experiment_round.model_dump_json(by_alias=True),
             },
         )
 
     def save_round(self, experiment_round: ExperimentRound) -> None:
-        """Persist an updated experiment round (e.g. on close)."""
-        self._update(
+        """Persist an updated experiment round (e.g. on close).
+
+        The run, round number, and originating batch are immutable; only the
+        JSON state (status/closedAt/experimentRunIds) may change.
+        """
+        self._guard_immutable(
             "experiment_round",
             experiment_round.id,
             {
+                "campaign_run_id": experiment_round.campaign_run_id,
                 "round_number": experiment_round.round_number,
-                "data": experiment_round.model_dump_json(by_alias=True),
+                "recommendation_batch_id": experiment_round.recommendation_batch_id,
             },
+        )
+        self._update(
+            "experiment_round",
+            experiment_round.id,
+            {"data": experiment_round.model_dump_json(by_alias=True)},
         )
 
     def get_round(self, round_id: str) -> ExperimentRound | None:
@@ -380,7 +479,28 @@ class SqliteRepository:
     # ExperimentRun ---------------------------------------------------------
 
     def add_experiment_run(self, experiment_run: ExperimentRun) -> None:
-        """Insert a new experiment run."""
+        """Insert a new experiment run, enforcing round/run ownership.
+
+        The owning round must exist and belong to the same campaign run as the
+        experiment run, so an experiment can never be filed under a round from a
+        different run.
+
+        Raises:
+            PersistenceError: If the round is unknown or belongs to a different
+                run.
+        """
+        experiment_round = self.get_round(experiment_run.experiment_round_id)
+        if experiment_round is None:
+            raise PersistenceError(
+                "Experiment run references unknown round "
+                f"{experiment_run.experiment_round_id!r}."
+            )
+        if experiment_round.campaign_run_id != experiment_run.campaign_run_id:
+            raise PersistenceError(
+                "An experiment run and its round must belong to the same run: "
+                f"experiment on {experiment_run.campaign_run_id!r}, round on "
+                f"{experiment_round.campaign_run_id!r}."
+            )
         self._insert(
             "experiment_run",
             {
@@ -392,14 +512,22 @@ class SqliteRepository:
         )
 
     def save_experiment_run(self, experiment_run: ExperimentRun) -> None:
-        """Persist an updated experiment run (status/result changes)."""
-        self._update(
+        """Persist an updated experiment run (status/result changes).
+
+        The owning run and round are immutable; only the JSON state may change.
+        """
+        self._guard_immutable(
             "experiment_run",
             experiment_run.id,
             {
+                "campaign_run_id": experiment_run.campaign_run_id,
                 "experiment_round_id": experiment_run.experiment_round_id,
-                "data": experiment_run.model_dump_json(by_alias=True),
             },
+        )
+        self._update(
+            "experiment_run",
+            experiment_run.id,
+            {"data": experiment_run.model_dump_json(by_alias=True)},
         )
 
     def get_experiment_run(self, experiment_run_id: str) -> ExperimentRun | None:
@@ -443,6 +571,7 @@ class SqliteRepository:
                 existing chain, or the supersede pointer is malformed.
         """
         with self.transaction():
+            self._require_measurement_output(measurement)
             chain = self._measurement_chain(
                 measurement.experiment_run_id, measurement.output_id
             )
@@ -474,6 +603,42 @@ class SqliteRepository:
                     "revision": measurement.revision,
                     "data": measurement.model_dump_json(by_alias=True),
                 },
+            )
+
+    def _require_measurement_output(self, measurement: Measurement) -> None:
+        """Reject a measurement whose output is not in the run's pinned revision.
+
+        A measurement is attached to an experiment run, which belongs to a
+        campaign run pinned to a definition revision. The measured ``outputId``
+        must be one of that revision's declared outputs; otherwise the reading
+        is unattributable.
+
+        Raises:
+            PersistenceError: If the experiment run, its run, or the pinned
+                revision cannot be resolved, or the output is not declared.
+        """
+        experiment_run = self.get_experiment_run(measurement.experiment_run_id)
+        if experiment_run is None:
+            raise PersistenceError(
+                "Measurement references unknown experiment run "
+                f"{measurement.experiment_run_id!r}."
+            )
+        run = self.get_run(experiment_run.campaign_run_id)
+        if run is None:
+            raise PersistenceError(
+                "Cannot resolve the campaign run for experiment run "
+                f"{experiment_run.id!r}."
+            )
+        revision = self.get_revision(run.definition_revision_id)
+        if revision is None:
+            raise PersistenceError(
+                "Cannot resolve the pinned revision "
+                f"{run.definition_revision_id!r} for output validation."
+            )
+        if measurement.output_id not in {output.id for output in revision.outputs}:
+            raise PersistenceError(
+                f"Measurement output {measurement.output_id!r} is not declared by "
+                f"the run's pinned revision {revision.id!r}."
             )
 
     def _measurement_chain(
@@ -516,14 +681,23 @@ class SqliteRepository:
         )
 
     def save_batch(self, batch: RecommendationBatch) -> None:
-        """Persist an updated batch (status changes)."""
-        self._update(
+        """Persist an updated batch (status changes).
+
+        The owning run and round number are immutable; only the JSON state
+        (e.g. status) may change.
+        """
+        self._guard_immutable(
             "recommendation_batch",
             batch.id,
             {
+                "campaign_run_id": batch.campaign_run_id,
                 "round_number": batch.round_number,
-                "data": batch.model_dump_json(by_alias=True),
             },
+        )
+        self._update(
+            "recommendation_batch",
+            batch.id,
+            {"data": batch.model_dump_json(by_alias=True)},
         )
 
     def get_batch(self, batch_id: str) -> RecommendationBatch | None:

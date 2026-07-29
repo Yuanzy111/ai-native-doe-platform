@@ -656,15 +656,33 @@ def active_measurements(measurements: list[Measurement]) -> list[Measurement]:
 def validate_supersede_chains(measurements: list[Measurement]) -> ValidationResult:
     """Check the integrity of every ``(experimentRunId, outputId)`` chain (§2.12).
 
+    Each ``(experimentRunId, outputId)`` must form a single linear supersede
+    chain: globally unique ids; per-key revisions ``1..n`` with no duplicates or
+    gaps; every revision after the first superseding exactly the immediately
+    preceding revision; no foreign or dangling pointers; no branch (two readings
+    superseding the same one), no cycle, and exactly one head.
+
     Args:
         measurements: All measurements to consider.
 
     Returns:
-        A :class:`ValidationResult`; a dangling/foreign supersede pointer or more
-        than one chain head per key is blocking.
+        A :class:`ValidationResult`; any of the above violations is blocking.
     """
     issues: list[ValidationIssue] = []
     by_id = {m.id: m for m in measurements}
+
+    id_counts = Counter(m.id for m in measurements)
+    for measurement_id, count in id_counts.items():
+        if count > 1:
+            issues.append(
+                ValidationIssue(
+                    code="DUPLICATE_MEASUREMENT_ID",
+                    message=f"Measurement id {measurement_id!r} appears {count} "
+                    "times; ids must be unique.",
+                    severity=Severity.BLOCKING,
+                    related_entity_id=measurement_id,
+                )
+            )
 
     groups: dict[tuple[str, str], list[Measurement]] = {}
     for m in measurements:
@@ -705,18 +723,119 @@ def validate_supersede_chains(measurements: list[Measurement]) -> ValidationResu
         if m.supersedes_measurement_id is not None
     }
     for key, group in groups.items():
-        heads = [m for m in group if m.id not in superseded_ids]
-        if len(heads) > 1:
+        issues.extend(_validate_chain_group(key, group, superseded_ids))
+
+    issues.extend(_detect_supersede_cycles(measurements, by_id))
+
+    return ValidationResult(issues=tuple(issues))
+
+
+def _validate_chain_group(
+    key: tuple[str, str],
+    group: list[Measurement],
+    superseded_ids: set[str | None],
+) -> list[ValidationIssue]:
+    """Validate one ``(experimentRunId, outputId)`` group as a linear chain."""
+    issues: list[ValidationIssue] = []
+
+    heads = [m for m in group if m.id not in superseded_ids]
+    if len(heads) > 1:
+        issues.append(
+            ValidationIssue(
+                code="MULTIPLE_CHAIN_HEADS",
+                message=f"({key[0]}, {key[1]}) has {len(heads)} active heads; "
+                "expected exactly one supersede chain.",
+                severity=Severity.BLOCKING,
+            )
+        )
+
+    revision_counts = Counter(m.revision for m in group)
+    for revision, count in revision_counts.items():
+        if count > 1:
             issues.append(
                 ValidationIssue(
-                    code="MULTIPLE_CHAIN_HEADS",
-                    message=f"({key[0]}, {key[1]}) has {len(heads)} active heads; "
-                    "expected exactly one supersede chain.",
+                    code="DUPLICATE_REVISION",
+                    message=f"({key[0]}, {key[1]}) has {count} measurements at "
+                    f"revision {revision}; revisions must be unique.",
                     severity=Severity.BLOCKING,
                 )
             )
 
-    return ValidationResult(issues=tuple(issues))
+    if sorted(m.revision for m in group) != list(range(1, len(group) + 1)):
+        issues.append(
+            ValidationIssue(
+                code="REVISION_NOT_CONTIGUOUS",
+                message=f"({key[0]}, {key[1]}) revisions must be contiguous from 1 "
+                f"to {len(group)}.",
+                severity=Severity.BLOCKING,
+            )
+        )
+
+    target_counts = Counter(
+        m.supersedes_measurement_id
+        for m in group
+        if m.supersedes_measurement_id is not None
+    )
+    for target, count in target_counts.items():
+        if count > 1:
+            issues.append(
+                ValidationIssue(
+                    code="SUPERSEDE_BRANCH",
+                    message=f"Measurement {target!r} is superseded by {count} "
+                    "measurements; a chain may not branch.",
+                    severity=Severity.BLOCKING,
+                    related_entity_id=target,
+                )
+            )
+
+    by_revision: dict[int, Measurement] = {}
+    for m in group:
+        by_revision.setdefault(m.revision, m)
+    for m in group:
+        if m.revision == 1:
+            continue
+        predecessor = by_revision.get(m.revision - 1)
+        if predecessor is None or m.supersedes_measurement_id != predecessor.id:
+            issues.append(
+                ValidationIssue(
+                    code="SUPERSEDES_NOT_PREDECESSOR",
+                    message=f"Measurement {m.id!r} (revision {m.revision}) must "
+                    "supersede the immediately preceding revision.",
+                    severity=Severity.BLOCKING,
+                    related_entity_id=m.id,
+                )
+            )
+
+    return issues
+
+
+def _detect_supersede_cycles(
+    measurements: list[Measurement], by_id: dict[str, Measurement]
+) -> list[ValidationIssue]:
+    """Flag any measurement that lies on a supersede cycle."""
+    issues: list[ValidationIssue] = []
+    reported: set[str] = set()
+    for start in measurements:
+        seen: set[str] = set()
+        node: Measurement | None = start
+        while node is not None:
+            if node.id in seen:
+                if node.id not in reported:
+                    reported.add(node.id)
+                    issues.append(
+                        ValidationIssue(
+                            code="SUPERSEDE_CYCLE",
+                            message=f"Measurement {node.id!r} lies on a supersede "
+                            "cycle.",
+                            severity=Severity.BLOCKING,
+                            related_entity_id=node.id,
+                        )
+                    )
+                break
+            seen.add(node.id)
+            target = node.supersedes_measurement_id
+            node = by_id.get(target) if target is not None else None
+    return issues
 
 
 __all__ = [

@@ -36,10 +36,19 @@ class TestOrphanEntities:
 class TestUniqueConstraints:
     """The round-number uniqueness constraints reject a second row per key."""
 
-    def test_duplicate_round_number_is_rejected(self, seeded_run, make_round):
-        seeded_run.add_round(make_round(id="round-1", round_number=1))
+    def test_duplicate_round_number_is_rejected(
+        self, seeded_run, make_round, make_batch
+    ):
+        seeded_run.add_batch(make_batch(id="batch-1", round_number=1))
+        seeded_run.add_round(
+            make_round(id="round-1", round_number=1, recommendation_batch_id="batch-1")
+        )
         with pytest.raises(PersistenceError):
-            seeded_run.add_round(make_round(id="round-2", round_number=1))
+            seeded_run.add_round(
+                make_round(
+                    id="round-2", round_number=1, recommendation_batch_id="batch-1"
+                )
+            )
 
     def test_duplicate_batch_round_number_is_rejected(self, seeded_run, make_batch):
         seeded_run.add_batch(make_batch(id="batch-1", round_number=1))

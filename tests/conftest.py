@@ -222,6 +222,15 @@ def service(repo):
 
 
 @pytest.fixture
+def seeded_definition(repo):
+    """Seed a definition and its first revision (``cd-1`` / ``rev-1``); no run."""
+    with repo.transaction():
+        repo.add_definition(_definition())
+        repo.add_revision(_revision())
+    return repo
+
+
+@pytest.fixture
 def seeded_run(repo):
     """Seed a definition, first revision, and Draft run; return the repository.
 
@@ -237,8 +246,13 @@ def seeded_run(repo):
 
 @pytest.fixture
 def seeded_experiment(seeded_run):
-    """Extend :func:`seeded_run` with a round and one experiment run (``exp-1``)."""
+    """Extend :func:`seeded_run` with a batch, a round, and one experiment run.
+
+    A round is tied to its originating recommendation batch, so ``batch-1`` is
+    seeded before ``round-1`` and the experiment run ``exp-1``.
+    """
     with seeded_run.transaction():
+        seeded_run.add_batch(_batch())
         seeded_run.add_round(_round())
         seeded_run.add_experiment_run(_experiment_run())
     return seeded_run

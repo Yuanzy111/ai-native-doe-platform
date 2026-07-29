@@ -69,13 +69,15 @@ class TestMalformedChains:
 class TestTransactionRollback:
     """A failed unit of work leaves the store untouched."""
 
-    def test_rollback_discards_writes(self, seeded_run, make_round):
+    def test_rollback_discards_writes(self, seeded_run, make_round, make_batch):
         repo = seeded_run
         with pytest.raises(RuntimeError):
             with repo.transaction():
+                repo.add_batch(make_batch(id="batch-1", round_number=1))
                 repo.add_round(make_round(id="round-1", round_number=1))
                 raise RuntimeError("boom")
         assert repo.get_round("round-1") is None
+        assert repo.get_batch("batch-1") is None
 
     def test_failed_measurement_insert_persists_nothing(
         self, seeded_run, make_measurement
