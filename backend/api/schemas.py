@@ -63,4 +63,24 @@ class CreateCampaignRunRequest(_RequestBase):
     budget_total: int = Field(ge=1)
 
 
-__all__ = ["CreateCampaignRunRequest", "OptimizationPolicyInput"]
+class SaveDesignSpaceRequest(_RequestBase):
+    """The body of ``PUT /api/v1/campaign-runs/{runId}/design-space``.
+
+    Carries only the editable design space and policy; the run, campaign, and
+    budget are addressed by the path and never re-supplied here.
+    """
+
+    parameters: list[ParameterSpec] = Field(min_length=1)
+    outputs: list[OutputSpec] = Field(min_length=1)
+    targets: list[TargetSpec] = Field(min_length=1)
+    objective_policy: ObjectivePolicy
+    constraints: list[ConstraintSpec] = Field(default_factory=list)
+    constraints_confirmed: bool = False
+    optimization_policy: OptimizationPolicyInput
+
+
+__all__ = [
+    "CreateCampaignRunRequest",
+    "OptimizationPolicyInput",
+    "SaveDesignSpaceRequest",
+]

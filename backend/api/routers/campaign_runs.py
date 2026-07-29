@@ -16,8 +16,8 @@ from fastapi import APIRouter, Depends, status
 
 from backend.api.dependencies import get_actor, get_query_service, get_service
 from backend.api.query import RunQueryService
-from backend.api.schemas import CreateCampaignRunRequest
-from backend.application import ApplicationService
+from backend.api.schemas import CreateCampaignRunRequest, SaveDesignSpaceRequest
+from backend.application import ApplicationService, DesignSpaceUpdate
 from backend.domain.models import (
     CampaignDefinition,
     CampaignDefinitionRevision,
@@ -121,6 +121,43 @@ def validate_design_space(
             **result.model_dump(mode="json", by_alias=True),
         },
         "campaignRun": query.run_view(run_id)["campaignRun"],
+    }
+
+
+@router.put("/{run_id}/design-space")
+def save_design_space(
+    run_id: str,
+    body: SaveDesignSpaceRequest,
+    actor: str = Depends(get_actor),
+    service: ApplicationService = Depends(get_service),
+    query: RunQueryService = Depends(get_query_service),
+) -> dict[str, Any]:
+    """Save an edited design space and/or policy for an editable run.
+
+    The service decides what actually changed (creating a new revision and/or
+    minting a new policy id), drops a validated run back to ``Draft`` on any
+    change, and treats an identical request as a no-op. The response reports the
+    change flags alongside the full refreshed aggregate view.
+    """
+    update = DesignSpaceUpdate(
+        parameters=body.parameters,
+        outputs=body.outputs,
+        targets=body.targets,
+        objective_policy=body.objective_policy,
+        constraints=body.constraints,
+        constraints_confirmed=body.constraints_confirmed,
+        backend_name=body.optimization_policy.backend_name,
+        batch_size=body.optimization_policy.batch_size,
+        seed_policy=body.optimization_policy.seed_policy,
+        seed_value=body.optimization_policy.seed_value,
+        strategy_config=body.optimization_policy.strategy_config,
+    )
+    result = service.save_design_space(run_id, actor, update)
+    return {
+        "changed": result.changed,
+        "revisionChanged": result.revision_changed,
+        "policyChanged": result.policy_changed,
+        "view": query.run_view(run_id),
     }
 
 

@@ -2,8 +2,16 @@
 
 from backend.application.service import (
     ApplicationService,
+    DesignSpaceSaveResult,
+    DesignSpaceUpdate,
     EntityNotFoundError,
     ServiceError,
 )
 
-__all__ = ["ApplicationService", "EntityNotFoundError", "ServiceError"]
+__all__ = [
+    "ApplicationService",
+    "DesignSpaceSaveResult",
+    "DesignSpaceUpdate",
+    "EntityNotFoundError",
+    "ServiceError",
+]

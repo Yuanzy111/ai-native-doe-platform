@@ -20,6 +20,7 @@ rather than letting a caller jump the run's state on its own.
 """
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,16 +30,23 @@ from backend.domain.models import (
     CampaignDefinition,
     CampaignDefinitionRevision,
     CampaignRun,
+    ConstraintSpec,
     DecisionAction,
     DecisionLog,
     ExperimentRound,
     ExperimentRun,
     ExperimentRunStatus,
     Measurement,
+    ObjectivePolicy,
     OptimizationPolicy,
+    OutputSpec,
+    ParameterSpec,
     RecommendationBatch,
     RoundStatus,
     RunStatus,
+    SeedPolicy,
+    StrategyConfig,
+    TargetSpec,
 )
 from backend.domain.validation import (
     RunEvent,
@@ -81,6 +89,44 @@ class EntityNotFoundError(ServiceError):
     call sites keep matching, while callers that care about the difference (the
     HTTP layer mapping to ``404`` versus ``409``) can catch it specifically.
     """
+
+
+@dataclass(frozen=True)
+class DesignSpaceUpdate:
+    """The user-supplied design space and policy for :meth:`save_design_space`.
+
+    Carries only content the caller controls: the revision fields and the policy
+    fields *without* an id (the service mints a new policy id when the policy
+    actually changes). It is a service-owned value object so the router never
+    hands raw request DTOs into the service.
+    """
+
+    parameters: list[ParameterSpec]
+    outputs: list[OutputSpec]
+    targets: list[TargetSpec]
+    objective_policy: ObjectivePolicy
+    constraints: list[ConstraintSpec]
+    constraints_confirmed: bool
+    backend_name: str
+    batch_size: int
+    seed_policy: SeedPolicy
+    seed_value: int | None
+    strategy_config: StrategyConfig
+
+
+@dataclass(frozen=True)
+class DesignSpaceSaveResult:
+    """The outcome of :meth:`save_design_space`.
+
+    ``changed`` is ``True`` iff the revision content or the policy actually
+    differed from what the run already held; the two component flags say which.
+    ``run`` is the run as it stands after the save (unchanged on a no-op).
+    """
+
+    changed: bool
+    revision_changed: bool
+    policy_changed: bool
+    run: CampaignRun
 
 
 def _now() -> datetime:
@@ -240,6 +286,167 @@ class ApplicationService:
         with self._repo.transaction():
             self.create_campaign(definition, first_revision)
             return self.create_run(run)
+
+    def save_design_space(
+        self, run_id: str, actor: str, update: DesignSpaceUpdate
+    ) -> DesignSpaceSaveResult:
+        """Persist an edited design space and/or policy for an editable run (§3.6).
+
+        Editing is only allowed while the run is ``Draft`` or
+        ``DesignSpaceValidated`` and no recommendation batch has been generated;
+        anything else is a conflict. The whole save is one transaction:
+
+        * If the revision content changed, a new immutable
+          :class:`CampaignDefinitionRevision` is appended (``revisionNumber`` =
+          head + 1, ``parentRevisionId`` = current head), the definition head is
+          advanced, and the run is repinned to it.
+        * If the policy changed, the service mints a fresh policy id and swaps the
+          run's policy atomically.
+        * If either changed and the run was ``DesignSpaceValidated``, it drops
+          back to ``Draft`` so validation must be re-run.
+        * If neither changed, it is a no-op: no revision, no state change, no log.
+
+        Args:
+            run_id: The run to edit.
+            actor: The identity that authored the edit (stamped on new records).
+            update: The desired design space and policy content.
+
+        Returns:
+            A :class:`DesignSpaceSaveResult` describing what changed.
+
+        Raises:
+            EntityNotFoundError: If the run does not exist.
+            ServiceError: If the run is not editable or already has a batch.
+        """
+        with self._repo.transaction():
+            run = self._require_run(run_id)
+            self._require_editable(run)
+            self._reject_if_batched(run_id, "designSpace")
+
+            current = self._repo.get_revision(run.definition_revision_id)
+            if current is None:
+                raise ServiceError(
+                    f"Run {run_id!r} pins unknown revision "
+                    f"{run.definition_revision_id!r}."
+                )
+            revision_changed = self._revision_content_differs(current, update)
+            policy_changed = self._policy_content_differs(
+                run.optimization_policy, update
+            )
+
+            if not revision_changed and not policy_changed:
+                return DesignSpaceSaveResult(
+                    changed=False,
+                    revision_changed=False,
+                    policy_changed=False,
+                    run=run,
+                )
+
+            now = _now()
+            run_update: dict[str, Any] = {"updated_at": now}
+
+            if revision_changed:
+                definition = self._repo.get_definition(run.campaign_definition_id)
+                if definition is None:
+                    raise ServiceError(
+                        f"Run {run_id!r} references unknown definition "
+                        f"{run.campaign_definition_id!r}."
+                    )
+                head = self._repo.get_revision(definition.head_revision_id)
+                if head is None:
+                    raise ServiceError(
+                        f"Definition {definition.id!r} points at unknown head "
+                        f"revision {definition.head_revision_id!r}."
+                    )
+                new_revision = CampaignDefinitionRevision(
+                    id=str(uuid.uuid4()),
+                    campaign_definition_id=run.campaign_definition_id,
+                    revision_number=head.revision_number + 1,
+                    parent_revision_id=head.id,
+                    parameters=update.parameters,
+                    outputs=update.outputs,
+                    targets=update.targets,
+                    objective_policy=update.objective_policy,
+                    constraints=update.constraints,
+                    constraints_confirmed=update.constraints_confirmed,
+                    constraints_confirmed_at=now
+                    if update.constraints_confirmed
+                    else None,
+                    created_at=now,
+                    created_by=actor,
+                )
+                self._repo.add_revision(new_revision)
+                self._repo.save_definition(
+                    definition.model_copy(
+                        update={
+                            "head_revision_id": new_revision.id,
+                            "updated_at": now,
+                        }
+                    )
+                )
+                run_update["definition_revision_id"] = new_revision.id
+
+            if policy_changed:
+                run_update["optimization_policy"] = OptimizationPolicy(
+                    id=str(uuid.uuid4()),
+                    backend_name=update.backend_name,
+                    batch_size=update.batch_size,
+                    seed_policy=update.seed_policy,
+                    seed_value=update.seed_value,
+                    strategy_config=update.strategy_config,
+                )
+
+            if run.status is RunStatus.DESIGN_SPACE_VALIDATED:
+                run_update["status"] = RunStatus.DRAFT
+
+            updated_run = run.model_copy(update=run_update)
+            self._repo.save_run(updated_run)
+
+            if revision_changed:
+                self._repo.append_decision_log(
+                    DecisionLog(
+                        id=str(uuid.uuid4()),
+                        campaign_run_id=run_id,
+                        timestamp=now,
+                        actor=actor,
+                        action=DecisionAction.DEFINITION_REVISION_CREATED,
+                        definition_revision_id=updated_run.definition_revision_id,
+                    )
+                )
+
+            return DesignSpaceSaveResult(
+                changed=True,
+                revision_changed=revision_changed,
+                policy_changed=policy_changed,
+                run=updated_run,
+            )
+
+    @staticmethod
+    def _revision_content_differs(
+        current: CampaignDefinitionRevision, update: DesignSpaceUpdate
+    ) -> bool:
+        """Return whether the desired design space differs from ``current``."""
+        return (
+            list(current.parameters) != list(update.parameters)
+            or list(current.outputs) != list(update.outputs)
+            or list(current.targets) != list(update.targets)
+            or current.objective_policy != update.objective_policy
+            or list(current.constraints) != list(update.constraints)
+            or current.constraints_confirmed != update.constraints_confirmed
+        )
+
+    @staticmethod
+    def _policy_content_differs(
+        current: OptimizationPolicy, update: DesignSpaceUpdate
+    ) -> bool:
+        """Return whether the desired policy differs from ``current`` (ignoring id)."""
+        return (
+            current.backend_name != update.backend_name
+            or current.batch_size != update.batch_size
+            or current.seed_policy != update.seed_policy
+            or current.seed_value != update.seed_value
+            or current.strategy_config != update.strategy_config
+        )
 
     # Run state changes -----------------------------------------------------
 
@@ -1125,6 +1332,8 @@ class ApplicationService:
 
 __all__ = [
     "ApplicationService",
+    "DesignSpaceSaveResult",
+    "DesignSpaceUpdate",
     "ServiceError",
     "EntityNotFoundError",
     "PersistenceError",
