@@ -23,6 +23,7 @@ Status mapping (§ requirements):
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -39,6 +40,13 @@ from backend.adapters.errors import (
 from backend.application import EntityNotFoundError, ServiceError
 from backend.domain.validation import StateTransitionError
 from backend.persistence import PersistenceError
+
+_logger = logging.getLogger("backend.api")
+
+_ADAPTER_COMPUTATION_MESSAGE = (
+    "The optimization backend failed to generate a design."
+)
+_ADAPTER_GENERIC_MESSAGE = "The optimization backend could not fulfill the request."
 
 
 class ApiError(Exception):
@@ -127,12 +135,17 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def _handle_adapter_computation(
         _: Request, exc: AdapterComputationError
     ) -> JSONResponse:
-        return _json(502, "ADAPTER_COMPUTATION_FAILED", str(exc))
+        # The backend's raw failure message may carry internal detail, so it is
+        # logged server-side only; the client sees a fixed, generic message.
+        _logger.exception("Adapter computation failed: %s", exc)
+        return _json(502, "ADAPTER_COMPUTATION_FAILED", _ADAPTER_COMPUTATION_MESSAGE)
 
     @app.exception_handler(AdapterError)
     async def _handle_adapter_error(_: Request, exc: AdapterError) -> JSONResponse:
-        # Any adapter-boundary error not matched more specifically above.
-        return _json(502, "ADAPTER_ERROR", str(exc))
+        # Any adapter-boundary error not matched more specifically above; treat
+        # it like a computation failure and never surface the raw message.
+        _logger.exception("Adapter error: %s", exc)
+        return _json(502, "ADAPTER_ERROR", _ADAPTER_GENERIC_MESSAGE)
 
     @app.exception_handler(StateTransitionError)
     async def _handle_state_transition(

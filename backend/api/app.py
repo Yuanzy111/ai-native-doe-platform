@@ -5,6 +5,13 @@ database path and optimizer adapter. No SQLite connection is opened at import
 time: the schema is initialized once here (opening and immediately closing a
 throwaway connection), and every request later opens its own short-lived
 connection via the request-scoped dependency.
+
+The API accepts only a *file-backed* SQLite path. ``":memory:"`` is rejected
+outright: because every request opens its own connection, a ``":memory:"`` path
+would give each request a fresh, empty database, and sharing one global
+in-memory connection across requests/threads is exactly the cross-thread
+sharing this layer forbids. Domain and persistence unit tests may still use
+``":memory:"`` directly against a single :class:`SqliteRepository`.
 """
 
 from __future__ import annotations
@@ -25,14 +32,26 @@ def create_app(
     """Build a configured application.
 
     Args:
-        db_path: The SQLite file path (or ``":memory:"``). It is stored on
-            ``app.state`` and read per request; nothing is opened at import time.
+        db_path: A file-backed SQLite path. It is stored on ``app.state`` and
+            read per request; nothing is opened at import time. ``":memory:"``
+            is rejected because per-request connections cannot share one
+            in-memory database.
         adapter: The optimizer adapter used for recommendation legs. Injectable
             so tests can swap in a fake or the real BayBE adapter.
 
     Returns:
         A ready-to-serve :class:`FastAPI` application.
+
+    Raises:
+        ValueError: If ``db_path`` is ``":memory:"``.
     """
+    if db_path == ":memory:":
+        raise ValueError(
+            "The API requires a file-backed SQLite path; ':memory:' is not "
+            "supported because each request opens its own connection and an "
+            "in-memory database cannot be shared across them."
+        )
+
     app = FastAPI(title="Industrial Optimization API", version="v1")
     app.state.db_path = db_path
     app.state.adapter = adapter
