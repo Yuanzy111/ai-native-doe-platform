@@ -1,0 +1,17 @@
+# Pinned dependency lock for a clean-environment backend test run.
+# Regenerate with: micromamba run -n <env> python -m pip freeze
+# Covers the backend runtime (pydantic) and the test runner (pytest) only;
+# BayBE/BoFire and the optimizer adapters are intentionally excluded.
+annotated-types==0.8.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+typing_extensions==4.16.0
+typing_inspection==0.4.2
+
+# pytest and its transitive dependencies
+exceptiongroup==1.3.1
+iniconfig==2.3.0
+packaging==26.2
+pluggy==1.6.0
+Pygments==2.20.0
+pytest==9.1.1

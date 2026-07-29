@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS campaign_definition (
 
 CREATE TABLE IF NOT EXISTS campaign_definition_revision (
     id TEXT PRIMARY KEY,
-    campaign_definition_id TEXT NOT NULL,
+    campaign_definition_id TEXT NOT NULL REFERENCES campaign_definition (id),
     revision_number INTEGER NOT NULL,
     data TEXT NOT NULL,
     UNIQUE (campaign_definition_id, revision_number)
@@ -47,8 +47,8 @@ CREATE INDEX IF NOT EXISTS ix_revision_definition
 
 CREATE TABLE IF NOT EXISTS campaign_run (
     id TEXT PRIMARY KEY,
-    campaign_definition_id TEXT NOT NULL,
-    definition_revision_id TEXT NOT NULL,
+    campaign_definition_id TEXT NOT NULL REFERENCES campaign_definition (id),
+    definition_revision_id TEXT NOT NULL REFERENCES campaign_definition_revision (id),
     status TEXT NOT NULL,
     data TEXT NOT NULL
 );
@@ -57,17 +57,18 @@ CREATE INDEX IF NOT EXISTS ix_run_definition
 
 CREATE TABLE IF NOT EXISTS experiment_round (
     id TEXT PRIMARY KEY,
-    campaign_run_id TEXT NOT NULL,
+    campaign_run_id TEXT NOT NULL REFERENCES campaign_run (id),
     round_number INTEGER NOT NULL,
-    data TEXT NOT NULL
+    data TEXT NOT NULL,
+    UNIQUE (campaign_run_id, round_number)
 );
 CREATE INDEX IF NOT EXISTS ix_round_run
     ON experiment_round (campaign_run_id);
 
 CREATE TABLE IF NOT EXISTS experiment_run (
     id TEXT PRIMARY KEY,
-    campaign_run_id TEXT NOT NULL,
-    experiment_round_id TEXT NOT NULL,
+    campaign_run_id TEXT NOT NULL REFERENCES campaign_run (id),
+    experiment_round_id TEXT NOT NULL REFERENCES experiment_round (id),
     data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_experiment_run_round
@@ -77,26 +78,28 @@ CREATE INDEX IF NOT EXISTS ix_experiment_run_run
 
 CREATE TABLE IF NOT EXISTS measurement (
     id TEXT PRIMARY KEY,
-    experiment_run_id TEXT NOT NULL,
+    experiment_run_id TEXT NOT NULL REFERENCES experiment_run (id),
     output_id TEXT NOT NULL,
     revision INTEGER NOT NULL,
-    data TEXT NOT NULL
+    data TEXT NOT NULL,
+    UNIQUE (experiment_run_id, output_id, revision)
 );
 CREATE INDEX IF NOT EXISTS ix_measurement_experiment_run
     ON measurement (experiment_run_id);
 
 CREATE TABLE IF NOT EXISTS recommendation_batch (
     id TEXT PRIMARY KEY,
-    campaign_run_id TEXT NOT NULL,
+    campaign_run_id TEXT NOT NULL REFERENCES campaign_run (id),
     round_number INTEGER NOT NULL,
-    data TEXT NOT NULL
+    data TEXT NOT NULL,
+    UNIQUE (campaign_run_id, round_number)
 );
 CREATE INDEX IF NOT EXISTS ix_batch_run
     ON recommendation_batch (campaign_run_id);
 
 CREATE TABLE IF NOT EXISTS decision_log (
     id TEXT PRIMARY KEY,
-    campaign_run_id TEXT NOT NULL,
+    campaign_run_id TEXT NOT NULL REFERENCES campaign_run (id),
     data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_log_run
@@ -412,20 +415,77 @@ class SqliteRepository:
         ).fetchall()
         return [ExperimentRun.model_validate_json(row["data"]) for row in rows]
 
+    def list_experiment_runs_for_run(self, run_id: str) -> list[ExperimentRun]:
+        """List every experiment run of a campaign run, across all rounds."""
+        rows = self._conn.execute(
+            "SELECT data FROM experiment_run WHERE campaign_run_id = ?",
+            (run_id,),
+        ).fetchall()
+        return [ExperimentRun.model_validate_json(row["data"]) for row in rows]
+
     # Measurement (immutable, append-only) ----------------------------------
 
     def add_measurement(self, measurement: Measurement) -> None:
-        """Append an immutable measurement (corrections add new revisions)."""
-        self._insert(
-            "measurement",
-            {
-                "id": measurement.id,
-                "experiment_run_id": measurement.experiment_run_id,
-                "output_id": measurement.output_id,
-                "revision": measurement.revision,
-                "data": measurement.model_dump_json(by_alias=True),
-            },
-        )
+        """Append an immutable measurement, validating the supersede chain (§2.12).
+
+        Validation and insertion share one transaction so a concurrent reader can
+        never observe a half-applied correction. A new revision must extend the
+        current chain head contiguously: revision 1 with no predecessor, or
+        ``head.revision + 1`` directly superseding ``head.id`` for the same
+        ``(experimentRunId, outputId)``. This rejects gaps, branches, cycles, and
+        cross ``(experimentRunId, outputId)`` supersede pointers.
+
+        Args:
+            measurement: The reading to append.
+
+        Raises:
+            PersistenceError: If the revision does not contiguously extend the
+                existing chain, or the supersede pointer is malformed.
+        """
+        with self.transaction():
+            chain = self._measurement_chain(
+                measurement.experiment_run_id, measurement.output_id
+            )
+            if not chain:
+                if measurement.revision != 1 or measurement.supersedes_measurement_id:
+                    raise PersistenceError(
+                        "The first measurement for an (experimentRunId, outputId) "
+                        "must have revision=1 and no supersedesMeasurementId."
+                    )
+            else:
+                head = chain[-1]
+                if measurement.revision != head.revision + 1:
+                    raise PersistenceError(
+                        f"Measurement revision must increment by 1: expected "
+                        f"{head.revision + 1}, got {measurement.revision}."
+                    )
+                if measurement.supersedes_measurement_id != head.id:
+                    raise PersistenceError(
+                        f"A new measurement revision must directly supersede the "
+                        f"current chain head {head.id!r}, got "
+                        f"{measurement.supersedes_measurement_id!r}."
+                    )
+            self._insert(
+                "measurement",
+                {
+                    "id": measurement.id,
+                    "experiment_run_id": measurement.experiment_run_id,
+                    "output_id": measurement.output_id,
+                    "revision": measurement.revision,
+                    "data": measurement.model_dump_json(by_alias=True),
+                },
+            )
+
+    def _measurement_chain(
+        self, experiment_run_id: str, output_id: str
+    ) -> list[Measurement]:
+        """Return one ``(experimentRunId, outputId)`` chain ordered by revision."""
+        rows = self._conn.execute(
+            "SELECT data FROM measurement WHERE experiment_run_id = ? "
+            "AND output_id = ? ORDER BY revision ASC",
+            (experiment_run_id, output_id),
+        ).fetchall()
+        return [Measurement.model_validate_json(row["data"]) for row in rows]
 
     def get_measurement(self, measurement_id: str) -> Measurement | None:
         """Fetch a measurement by id."""

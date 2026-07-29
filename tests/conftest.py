@@ -13,6 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from backend.application import ApplicationService  # noqa: E402
 from backend.domain import models as m  # noqa: E402  (after sys.path setup)
 from backend.persistence import SqliteRepository  # noqa: E402
 
@@ -102,9 +103,142 @@ def make_run():
     return _run
 
 
+def _round(**overrides) -> m.ExperimentRound:
+    """Build a valid open experiment round."""
+    defaults = dict(
+        id="round-1",
+        campaign_run_id="run-1",
+        round_number=1,
+        recommendation_batch_id="batch-1",
+        experiment_run_ids=[],
+        opened_at="2026-07-29T00:00:00Z",
+        status=m.RoundStatus.OPEN,
+    )
+    defaults.update(overrides)
+    return m.ExperimentRound(**defaults)
+
+
+def _experiment_run(**overrides) -> m.ExperimentRun:
+    """Build a valid completed experiment run."""
+    defaults = dict(
+        id="exp-1",
+        campaign_run_id="run-1",
+        experiment_round_id="round-1",
+        parameter_values={"resin": 60.0, "hard": 40.0},
+        status=m.ExperimentRunStatus.COMPLETED,
+        executed_at="2026-07-29T01:00:00Z",
+        executed_by="user-1",
+    )
+    defaults.update(overrides)
+    return m.ExperimentRun(**defaults)
+
+
+def _measurement(**overrides) -> m.Measurement:
+    """Build a valid first-revision measurement."""
+    defaults = dict(
+        id="meas-1",
+        experiment_run_id="exp-1",
+        output_id="o1",
+        value=76.0,
+        status=m.MeasurementStatus.VALID,
+        revision=1,
+        supersedes_measurement_id=None,
+        recorded_at="2026-07-29T02:00:00Z",
+        recorded_by="user-1",
+    )
+    defaults.update(overrides)
+    return m.Measurement(**defaults)
+
+
+def _batch(**overrides) -> m.RecommendationBatch:
+    """Build a valid single-candidate recommendation batch."""
+    defaults = dict(
+        id="batch-1",
+        campaign_run_id="run-1",
+        round_number=1,
+        generated_at="2026-07-29T00:30:00Z",
+        input_snapshot={},
+        algorithm_config=m.AlgorithmConfig(
+            backend_name="baybe",
+            backend_version="0.13.0",
+            backend_commit="deadbeef",
+            strategy_kind="Botorch",
+            acquisition_function="qLogEI",
+            seed=42,
+            environment=m.Environment(
+                python_version="3.11.15",
+                torch_version="2.4.0",
+                botorch_version="0.11.0",
+                dependency_lock_hash="sha256:0",
+            ),
+        ),
+        candidates=[
+            m.RecommendationCandidate(
+                id="cand-1", parameter_values={"resin": 60.0, "hard": 40.0}
+            )
+        ],
+        status=m.BatchStatus.PROPOSED,
+    )
+    defaults.update(overrides)
+    return m.RecommendationBatch(**defaults)
+
+
+@pytest.fixture
+def make_round():
+    """Return the experiment-round factory."""
+    return _round
+
+
+@pytest.fixture
+def make_experiment_run():
+    """Return the experiment-run factory."""
+    return _experiment_run
+
+
+@pytest.fixture
+def make_measurement():
+    """Return the measurement factory."""
+    return _measurement
+
+
+@pytest.fixture
+def make_batch():
+    """Return the recommendation-batch factory."""
+    return _batch
+
+
 @pytest.fixture
 def repo():
     """Yield a fresh in-memory SQLite repository."""
     repository = SqliteRepository.connect(":memory:")
     yield repository
     repository.close()
+
+
+@pytest.fixture
+def service(repo):
+    """Return an application service over a fresh repository."""
+    return ApplicationService(repo)
+
+
+@pytest.fixture
+def seeded_run(repo):
+    """Seed a definition, first revision, and Draft run; return the repository.
+
+    Provides the full foreign-key graph (``cd-1`` / ``rev-1`` / ``run-1``) that
+    child entities (rounds, experiment runs, measurements, batches) depend on.
+    """
+    with repo.transaction():
+        repo.add_definition(_definition())
+        repo.add_revision(_revision())
+        repo.add_run(_run())
+    return repo
+
+
+@pytest.fixture
+def seeded_experiment(seeded_run):
+    """Extend :func:`seeded_run` with a round and one experiment run (``exp-1``)."""
+    with seeded_run.transaction():
+        seeded_run.add_round(_round())
+        seeded_run.add_experiment_run(_experiment_run())
+    return seeded_run

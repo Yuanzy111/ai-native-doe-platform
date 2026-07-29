@@ -11,13 +11,109 @@ conditionally required fields). Cross-entity semantic checks that produce
 user-facing issues (referential integrity, ``constraintsConfirmed`` gating,
 Desirability cutoff legality, objective/target consistency, constraint
 executability) live in :mod:`backend.domain.validation`.
+
+Hardening (see the backend hardening pass):
+
+* Every collection on a frozen value object is stored as an immutable
+  sequence/mapping (:class:`_FrozenList` / :class:`_FrozenDict`), so neither the
+  attribute nor its contents can be mutated in place.
+* ``model_copy(update=...)`` re-validates, so it cannot be used to bypass the
+  invariants below.
+* Timestamps are timezone-aware datetimes; numeric fields reject ``NaN``/``Inf``
+  and never silently coerce ``bool``; ids/names are stripped and must be
+  non-blank.
 """
 
-from enum import StrEnum
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from enum import StrEnum
+
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 from pydantic.alias_generators import to_camel
+
+
+# Immutable collections -----------------------------------------------------
+
+
+class _FrozenList(list):
+    """A ``list`` subclass that rejects every in-place mutation.
+
+    Equality still delegates to ``list`` so ``_FrozenList([1]) == [1]`` and JSON
+    serialization is unchanged; only the mutating methods are disabled.
+    """
+
+    def _immutable(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("This sequence is immutable and cannot be modified.")
+
+    append = extend = insert = remove = pop = clear = sort = reverse = _immutable
+    __setitem__ = __delitem__ = __iadd__ = __imul__ = _immutable
+
+
+class _FrozenDict(dict):
+    """A ``dict`` subclass that rejects every in-place mutation."""
+
+    def _immutable(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("This mapping is immutable and cannot be modified.")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = update = setdefault = _immutable
+    __ior__ = _immutable
+
+
+def _freeze_list(value: object) -> object:
+    """Wrap a plain ``list`` in a :class:`_FrozenList` (pass others through)."""
+    if isinstance(value, list) and not isinstance(value, _FrozenList):
+        return _FrozenList(value)
+    return value
+
+
+def _freeze_dict(value: object) -> object:
+    """Wrap a plain ``dict`` in a :class:`_FrozenDict` (pass others through)."""
+    if isinstance(value, dict) and not isinstance(value, _FrozenDict):
+        return _FrozenDict(value)
+    return value
+
+
+def _reject_bool(value: object) -> object:
+    """Reject ``bool`` so ``True``/``False`` never become ``1.0``/``0.0``."""
+    if isinstance(value, bool):
+        raise ValueError("A boolean is not a valid numeric value.")
+    return value
+
+
+def _strip_non_blank(value: object) -> object:
+    """Strip surrounding whitespace and reject blank strings."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Value must not be blank.")
+        return stripped
+    return value
+
+
+# Reusable field types ------------------------------------------------------
+
+Ident = Annotated[str, BeforeValidator(_strip_non_blank)]
+"""A stripped, non-blank identifier or name."""
+
+Finite = Annotated[float, BeforeValidator(_reject_bool), Field(allow_inf_nan=False)]
+"""A finite real number (no ``NaN``/``Inf``, and ``bool`` is rejected)."""
+
+PositiveFinite = Annotated[
+    float, BeforeValidator(_reject_bool), Field(gt=0, allow_inf_nan=False)
+]
+"""A finite, strictly positive real number."""
+
+_FrozenFloatList = Annotated[list[Finite], AfterValidator(_freeze_list)]
+_FrozenIdentList = Annotated[list[Ident], AfterValidator(_freeze_list)]
 
 
 class _Base(BaseModel):
@@ -29,8 +125,21 @@ class _Base(BaseModel):
         extra="forbid",
     )
 
+    def model_copy(self, *, update: dict[str, Any] | None = None, deep: bool = False):
+        """Copy the model, re-validating when ``update`` is supplied.
 
-class _FrozenBase(BaseModel):
+        Pydantic's default ``model_copy`` assigns ``update`` without validation,
+        which would let a caller bypass the invariants declared here. Routing
+        the update through :meth:`model_validate` re-runs every validator.
+        """
+        if not update:
+            return super().model_copy(deep=deep)
+        data = self.model_dump(mode="python", by_alias=False)
+        data.update(update)
+        return type(self).model_validate(data)
+
+
+class _FrozenBase(_Base):
     """Base for immutable value objects: same aliasing plus ``frozen=True``."""
 
     model_config = ConfigDict(
@@ -47,23 +156,23 @@ class _FrozenBase(BaseModel):
 class Bounds(_FrozenBase):
     """Numeric bounds for a continuous parameter."""
 
-    lower: float
+    lower: Finite
     """The inclusive lower bound."""
 
-    upper: float
+    upper: Finite
     """The inclusive upper bound."""
 
-    stepsize: float | None = None
+    stepsize: PositiveFinite | None = None
     """Optional discretization step; must be positive when given."""
 
 
 class _ParameterBase(_FrozenBase):
     """Shared fields of every parameter specification."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier used by constraints and value maps."""
 
-    name: str = Field(min_length=1)
+    name: Ident
     """The human-readable parameter name."""
 
     unit: str | None = None
@@ -84,16 +193,11 @@ class ContinuousParameterSpec(_ParameterBase):
 
     @model_validator(mode="after")
     def _validate_bounds(self) -> "ContinuousParameterSpec":
-        """Reject empty or inverted intervals and non-positive step sizes."""
+        """Reject empty or inverted intervals."""
         if self.bounds.lower >= self.bounds.upper:
             raise ValueError(
                 f"Continuous parameter {self.name!r} requires lower < upper, "
                 f"got lower={self.bounds.lower}, upper={self.bounds.upper}."
-            )
-        if self.bounds.stepsize is not None and self.bounds.stepsize <= 0:
-            raise ValueError(
-                f"Continuous parameter {self.name!r} stepsize must be positive, "
-                f"got {self.bounds.stepsize}."
             )
         return self
 
@@ -104,14 +208,14 @@ class DiscreteParameterSpec(_ParameterBase):
     type: Literal["Discrete"] = "Discrete"
     """The discriminator tag."""
 
-    values: list[float] = Field(min_length=1)
+    values: Annotated[list[Finite], Field(min_length=1)]
     """The allowed numeric levels, deduplicated and sorted ascending."""
 
     @field_validator("values")
     @classmethod
-    def _dedup_sort(cls, value: list[float]) -> list[float]:
+    def _dedup_sort(cls, value: list[float]) -> _FrozenList:
         """Deduplicate and sort the numeric levels (documented normalization)."""
-        return sorted(set(value))
+        return _FrozenList(sorted(set(value)))
 
 
 class CategoricalParameterSpec(_ParameterBase):
@@ -120,12 +224,12 @@ class CategoricalParameterSpec(_ParameterBase):
     type: Literal["Categorical"] = "Categorical"
     """The discriminator tag."""
 
-    values: list[str] = Field(min_length=1)
+    values: Annotated[list[str], Field(min_length=1)]
     """The allowed labels: non-blank, deduplicated, case-sensitive, ordered."""
 
     @field_validator("values")
     @classmethod
-    def _dedup_preserve_order(cls, value: list[str]) -> list[str]:
+    def _dedup_preserve_order(cls, value: list[str]) -> _FrozenList:
         """Reject blank labels and drop case-sensitive duplicates in order."""
         seen: list[str] = []
         for label in value:
@@ -133,7 +237,7 @@ class CategoricalParameterSpec(_ParameterBase):
                 raise ValueError("Categorical values must be non-blank.")
             if label not in seen:
                 seen.append(label)
-        return seen
+        return _FrozenList(seen)
 
 
 ParameterSpec = Annotated[
@@ -149,10 +253,10 @@ ParameterSpec = Annotated[
 class OutputSpec(_FrozenBase):
     """A measurable quantity, carrying no optimization direction."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier referenced by targets and measurements."""
 
-    name: str = Field(min_length=1)
+    name: Ident
     """The human-readable output name."""
 
     unit: str | None = None
@@ -175,17 +279,26 @@ class Direction(StrEnum):
 class TargetSpec(_FrozenBase):
     """The optimization direction attached to exactly one output."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier referenced by the objective policy."""
 
-    output_id: str = Field(min_length=1)
+    output_id: Ident
     """The referenced :class:`OutputSpec` id."""
 
     direction: Direction
     """The optimization direction (``Target``/``CloseToTarget`` are v1+)."""
 
-    target_value: float | None = None
-    """Reserved for ``direction='Target'`` in v1+; unused in the MVP."""
+    target_value: Finite | None = None
+    """Reserved for ``direction='Target'`` in v1+; must be ``null`` in the MVP."""
+
+    @model_validator(mode="after")
+    def _validate_mvp(self) -> "TargetSpec":
+        """The MVP only supports Maximize/Minimize; ``targetValue`` must be null."""
+        if self.target_value is not None:
+            raise ValueError(
+                "targetValue must be null in the MVP (Target/CloseToTarget are v1+)."
+            )
+        return self
 
 
 # ObjectivePolicy (§2.7) ----------------------------------------------------
@@ -213,17 +326,17 @@ class Cutoffs(_FrozenBase):
     blocking issue rather than raised at construction.
     """
 
-    lower: float
+    lower: Finite
     """The value mapped to one end of the ramp."""
 
-    upper: float
+    upper: Finite
     """The value mapped to the other end of the ramp."""
 
 
 class DesirabilityEntry(_FrozenBase):
     """One target's contribution to a Desirability objective."""
 
-    target_id: str = Field(min_length=1)
+    target_id: Ident
     """The referenced :class:`TargetSpec` id."""
 
     transformation: Literal["NormalizedRamp"] = "NormalizedRamp"
@@ -232,8 +345,9 @@ class DesirabilityEntry(_FrozenBase):
     cutoffs: Cutoffs
     """The explicit scaling cutoffs; no runtime guessing is permitted."""
 
-    weight: float
-    """The relative weight; forced equal when ``weightingMode='equal'``."""
+    weight: PositiveFinite
+    """The relative weight (finite, strictly positive); forced equal when
+    ``weightingMode='equal'``."""
 
 
 class SingleObjectivePolicy(_FrozenBase):
@@ -242,7 +356,7 @@ class SingleObjectivePolicy(_FrozenBase):
     kind: Literal["Single"] = "Single"
     """The discriminator tag."""
 
-    target_id: str = Field(min_length=1)
+    target_id: Ident
     """The single referenced target; requires ``len(targets) == 1``."""
 
 
@@ -252,7 +366,7 @@ class DesirabilityObjectivePolicy(_FrozenBase):
     kind: Literal["Desirability"] = "Desirability"
     """The discriminator tag."""
 
-    entries: list[DesirabilityEntry] = Field(min_length=1)
+    entries: Annotated[list[DesirabilityEntry], AfterValidator(_freeze_list), Field(min_length=1)]
     """One entry per target; must cover every target one-to-one."""
 
     weighting_mode: WeightingMode
@@ -268,8 +382,15 @@ class ParetoObjectivePolicy(_FrozenBase):
     kind: Literal["Pareto"] = "Pareto"
     """The discriminator tag."""
 
-    target_ids: list[str] = Field(min_length=2)
-    """At least two referenced targets; produces a Pareto frontier."""
+    target_ids: Annotated[list[Ident], AfterValidator(_freeze_list), Field(min_length=2)]
+    """At least two distinct referenced targets; produces a Pareto frontier."""
+
+    @model_validator(mode="after")
+    def _validate_unique(self) -> "ParetoObjectivePolicy":
+        """Reject duplicate target ids (coverage is checked by the validator)."""
+        if len(set(self.target_ids)) != len(self.target_ids):
+            raise ValueError("Pareto targetIds must be unique.")
+        return self
 
 
 ObjectivePolicy = Annotated[
@@ -285,11 +406,20 @@ ObjectivePolicy = Annotated[
 class _ConstraintBase(_FrozenBase):
     """Shared fields of every constraint specification."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier."""
 
-    resolved_at: str | None = None
-    """The optional ISO-8601 timestamp at which the constraint was resolved."""
+    resolved_at: AwareDatetime | None = None
+    """The optional timezone-aware timestamp at which the constraint resolved."""
+
+
+def _validate_parameter_ids_unique(constraint: "_ConstraintBase") -> None:
+    """Raise when a constraint lists the same parameter id twice."""
+    ids = constraint.parameter_ids  # type: ignore[attr-defined]
+    if len(set(ids)) != len(ids):
+        raise ValueError(
+            f"Constraint {constraint.id!r}: parameterIds must be unique."
+        )
 
 
 class LinearEqualityConstraintSpec(_ConstraintBase):
@@ -298,23 +428,28 @@ class LinearEqualityConstraintSpec(_ConstraintBase):
     kind: Literal["LinearEquality"] = "LinearEquality"
     """The discriminator tag."""
 
-    parameter_ids: list[str] = Field(min_length=2)
-    """The referenced parameter ids (at least two)."""
+    parameter_ids: Annotated[list[Ident], AfterValidator(_freeze_list), Field(min_length=2)]
+    """The referenced parameter ids (at least two, unique)."""
 
-    coefficients: list[float]
-    """The per-parameter coefficients; must match ``parameterIds`` length."""
+    coefficients: _FrozenFloatList
+    """The per-parameter coefficients; finite, not all zero, matching length."""
 
-    rhs: float
+    rhs: Finite
     """The right-hand side of ``Σ coefficients[i] * value[i] = rhs``."""
 
     @model_validator(mode="after")
-    def _validate_length(self) -> "LinearEqualityConstraintSpec":
-        """Reject coefficient/parameter length mismatches."""
+    def _validate_structure(self) -> "LinearEqualityConstraintSpec":
+        """Reject length mismatch, duplicate ids, and all-zero coefficients."""
         if len(self.coefficients) != len(self.parameter_ids):
             raise ValueError(
                 f"Constraint {self.id!r}: coefficients length "
                 f"{len(self.coefficients)} must equal parameterIds length "
                 f"{len(self.parameter_ids)}."
+            )
+        _validate_parameter_ids_unique(self)
+        if all(c == 0 for c in self.coefficients):
+            raise ValueError(
+                f"Constraint {self.id!r}: coefficients must not be all zero."
             )
         return self
 
@@ -325,26 +460,31 @@ class LinearInequalityConstraintSpec(_ConstraintBase):
     kind: Literal["LinearInequality"] = "LinearInequality"
     """The discriminator tag."""
 
-    parameter_ids: list[str] = Field(min_length=2)
-    """The referenced parameter ids (at least two)."""
+    parameter_ids: Annotated[list[Ident], AfterValidator(_freeze_list), Field(min_length=2)]
+    """The referenced parameter ids (at least two, unique)."""
 
-    coefficients: list[float]
-    """The per-parameter coefficients; must match ``parameterIds`` length."""
+    coefficients: _FrozenFloatList
+    """The per-parameter coefficients; finite, not all zero, matching length."""
 
     operator: Literal["<=", ">="]
     """The inequality direction."""
 
-    rhs: float
+    rhs: Finite
     """The right-hand side of ``Σ coefficients[i] * value[i] (operator) rhs``."""
 
     @model_validator(mode="after")
-    def _validate_length(self) -> "LinearInequalityConstraintSpec":
-        """Reject coefficient/parameter length mismatches."""
+    def _validate_structure(self) -> "LinearInequalityConstraintSpec":
+        """Reject length mismatch, duplicate ids, and all-zero coefficients."""
         if len(self.coefficients) != len(self.parameter_ids):
             raise ValueError(
                 f"Constraint {self.id!r}: coefficients length "
                 f"{len(self.coefficients)} must equal parameterIds length "
                 f"{len(self.parameter_ids)}."
+            )
+        _validate_parameter_ids_unique(self)
+        if all(c == 0 for c in self.coefficients):
+            raise ValueError(
+                f"Constraint {self.id!r}: coefficients must not be all zero."
             )
         return self
 
@@ -355,8 +495,8 @@ class CardinalityConstraintSpec(_ConstraintBase):
     kind: Literal["Cardinality"] = "Cardinality"
     """The discriminator tag."""
 
-    parameter_ids: list[str] = Field(min_length=2)
-    """The referenced parameter ids (at least two)."""
+    parameter_ids: Annotated[list[Ident], AfterValidator(_freeze_list), Field(min_length=2)]
+    """The referenced parameter ids (at least two, unique)."""
 
     min_cardinality: int = Field(ge=0)
     """The minimum number of active parameters."""
@@ -366,7 +506,8 @@ class CardinalityConstraintSpec(_ConstraintBase):
 
     @model_validator(mode="after")
     def _validate_cardinality(self) -> "CardinalityConstraintSpec":
-        """Reject cardinality bounds outside ``0 <= min <= max <= len``."""
+        """Reject bad bounds and duplicate parameter ids."""
+        _validate_parameter_ids_unique(self)
         n = len(self.parameter_ids)
         if not (self.min_cardinality <= self.max_cardinality <= n):
             raise ValueError(
@@ -437,7 +578,7 @@ StrategyConfig = Annotated[
 class OptimizationPolicy(_FrozenBase):
     """The execution-side strategy carried by a :class:`CampaignRun`."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier."""
 
     backend_name: str = "baybe"
@@ -469,68 +610,70 @@ class OptimizationPolicy(_FrozenBase):
 class CampaignDefinition(_Base):
     """The stateless container pointing at its head revision."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier."""
 
-    name: str = Field(min_length=1)
+    name: Ident
     """The platform-unique campaign name."""
 
     goal: str | None = None
     """The optional free-text goal statement."""
 
-    head_revision_id: str = Field(min_length=1)
+    head_revision_id: Ident
     """The id of the current head :class:`CampaignDefinitionRevision`."""
 
-    created_at: str
-    """The ISO-8601 creation timestamp."""
+    created_at: AwareDatetime
+    """The timezone-aware creation timestamp."""
 
-    created_by: str
+    created_by: Ident
     """The creator identity."""
 
-    updated_at: str
-    """The ISO-8601 timestamp of the last container update."""
+    updated_at: AwareDatetime
+    """The timezone-aware timestamp of the last container update."""
 
 
 class CampaignDefinitionRevision(_FrozenBase):
     """An immutable snapshot of a campaign's problem definition."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier."""
 
-    campaign_definition_id: str = Field(min_length=1)
+    campaign_definition_id: Ident
     """The owning :class:`CampaignDefinition` id."""
 
     revision_number: int = Field(ge=1)
     """The monotonic per-container revision number (first is 1)."""
 
-    parent_revision_id: str | None = None
+    parent_revision_id: Ident | None = None
     """The predecessor revision id; ``None`` iff ``revisionNumber == 1``."""
 
-    parameters: list[ParameterSpec] = Field(min_length=1)
+    parameters: Annotated[list[ParameterSpec], AfterValidator(_freeze_list), Field(min_length=1)]
     """The parameter specifications (at least one)."""
 
-    outputs: list[OutputSpec] = Field(min_length=1)
+    outputs: Annotated[list[OutputSpec], AfterValidator(_freeze_list), Field(min_length=1)]
     """The output specifications (at least one)."""
 
-    targets: list[TargetSpec] = Field(min_length=1)
+    targets: Annotated[list[TargetSpec], AfterValidator(_freeze_list), Field(min_length=1)]
     """The target specifications (at least one)."""
 
     objective_policy: ObjectivePolicy
     """The single campaign-level objective policy."""
 
-    constraints: list[ConstraintSpec] = Field(default_factory=list)
+    constraints: Annotated[list[ConstraintSpec], AfterValidator(_freeze_list)] = Field(
+        default_factory=_FrozenList
+    )
     """The constraint specifications (possibly empty)."""
 
     constraints_confirmed: bool = False
     """Whether the user has confirmed the constraint set."""
 
-    constraints_confirmed_at: str | None = None
+    constraints_confirmed_at: AwareDatetime | None = None
     """The confirmation timestamp; required when ``constraintsConfirmed``."""
 
-    created_at: str
-    """The ISO-8601 creation timestamp."""
+    created_at: AwareDatetime
+    """The timezone-aware creation timestamp."""
 
-    created_by: str
+    created_by: Ident
     """The creator identity."""
 
     @model_validator(mode="after")
@@ -576,13 +719,13 @@ class RunStatus(StrEnum):
 class CampaignRun(_Base):
     """A single execution of a definition revision under one policy."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier."""
 
-    campaign_definition_id: str = Field(min_length=1)
+    campaign_definition_id: Ident
     """The owning :class:`CampaignDefinition` id."""
 
-    definition_revision_id: str = Field(min_length=1)
+    definition_revision_id: Ident
     """The pinned revision id (frozen after the first batch, §3.6)."""
 
     status: RunStatus
@@ -600,14 +743,24 @@ class CampaignRun(_Base):
     budget_used: int = Field(ge=0)
     """The count of terminal experiment runs consumed."""
 
-    created_at: str
-    """The ISO-8601 creation timestamp."""
+    created_at: AwareDatetime
+    """The timezone-aware creation timestamp."""
 
-    updated_at: str
-    """The ISO-8601 timestamp of the last update."""
+    updated_at: AwareDatetime
+    """The timezone-aware timestamp of the last update."""
 
-    created_by: str
+    created_by: Ident
     """The creator identity."""
+
+    @model_validator(mode="after")
+    def _validate_budget(self) -> "CampaignRun":
+        """Reject a consumed budget that exceeds the total."""
+        if self.budget_used > self.budget_total:
+            raise ValueError(
+                f"budgetUsed ({self.budget_used}) must not exceed budgetTotal "
+                f"({self.budget_total})."
+            )
+        return self
 
 
 # ExperimentRound (§2.10) ---------------------------------------------------
@@ -623,26 +776,26 @@ class RoundStatus(StrEnum):
 class ExperimentRound(_Base):
     """One round of experiments tied to a recommendation batch."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier."""
 
-    campaign_run_id: str = Field(min_length=1)
+    campaign_run_id: Ident
     """The owning :class:`CampaignRun` id."""
 
     round_number: int = Field(ge=1)
     """The round number, matching the batch's ``roundNumber``."""
 
-    recommendation_batch_id: str = Field(min_length=1)
+    recommendation_batch_id: Ident
     """The originating :class:`RecommendationBatch` id."""
 
     experiment_run_ids: list[str] = Field(default_factory=list)
     """The experiment run ids, growing as executions are recorded."""
 
-    opened_at: str
-    """The ISO-8601 timestamp the round was opened."""
+    opened_at: AwareDatetime
+    """The timezone-aware timestamp the round was opened."""
 
-    closed_at: str | None = None
-    """The ISO-8601 timestamp the round was closed, if closed."""
+    closed_at: AwareDatetime | None = None
+    """The timezone-aware timestamp the round was closed, if closed."""
 
     status: RoundStatus
     """The open/closed status."""
@@ -663,28 +816,28 @@ class ExperimentRunStatus(StrEnum):
 class ExperimentRun(_Base):
     """A single physical experiment execution."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier."""
 
-    campaign_run_id: str = Field(min_length=1)
+    campaign_run_id: Ident
     """The owning :class:`CampaignRun` id."""
 
-    experiment_round_id: str = Field(min_length=1)
+    experiment_round_id: Ident
     """The owning :class:`ExperimentRound` id."""
 
     recommendation_candidate_id: str | None = None
     """The originating candidate id; ``None`` for manual experiments."""
 
-    parameter_values: dict[str, str | float]
+    parameter_values: dict[str, str | Finite]
     """The value assigned to each configured parameter id."""
 
     status: ExperimentRunStatus
     """The physical execution status (not measurement readiness)."""
 
-    executed_at: str | None = None
+    executed_at: AwareDatetime | None = None
     """The execution timestamp; required when status is Completed/Failed."""
 
-    executed_by: str | None = None
+    executed_by: Ident | None = None
     """The executor identity; required when status is Completed/Failed."""
 
     notes: str | None = None
@@ -717,16 +870,16 @@ class MeasurementStatus(StrEnum):
 class Measurement(_FrozenBase):
     """An immutable reading of one output for one experiment run."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier."""
 
-    experiment_run_id: str = Field(min_length=1)
+    experiment_run_id: Ident
     """The owning :class:`ExperimentRun` id."""
 
-    output_id: str = Field(min_length=1)
+    output_id: Ident
     """The measured :class:`OutputSpec` id."""
 
-    value: float
+    value: Finite
     """The measured value."""
 
     status: MeasurementStatus
@@ -735,13 +888,13 @@ class Measurement(_FrozenBase):
     revision: int = Field(ge=1)
     """The version within ``(experimentRunId, outputId)`` (first is 1)."""
 
-    supersedes_measurement_id: str | None = None
+    supersedes_measurement_id: Ident | None = None
     """The superseded reading's id; ``None`` iff ``revision == 1``."""
 
-    recorded_at: str
-    """The ISO-8601 recording timestamp."""
+    recorded_at: AwareDatetime
+    """The timezone-aware recording timestamp."""
 
-    recorded_by: str
+    recorded_by: Ident
     """The recorder identity."""
 
     notes: str | None = None
@@ -769,38 +922,40 @@ class Measurement(_FrozenBase):
 class Environment(_FrozenBase):
     """The reproducibility environment captured with a batch."""
 
-    python_version: str = Field(min_length=1)
+    python_version: Ident
     """The Python version string."""
 
-    torch_version: str = Field(min_length=1)
+    torch_version: Ident
     """The torch version string."""
 
-    botorch_version: str = Field(min_length=1)
+    botorch_version: Ident
     """The BoTorch version string."""
 
-    dependency_lock_hash: str = Field(min_length=1)
+    dependency_lock_hash: Ident
     """The lock-file content hash (e.g. ``sha256:...``)."""
 
 
 class AlgorithmConfig(_FrozenBase):
     """The resolved algorithm configuration recorded with a batch."""
 
-    backend_name: str = Field(min_length=1)
+    backend_name: Ident
     """The backend name."""
 
-    backend_version: str = Field(min_length=1)
+    backend_version: Ident
     """The backend version."""
 
-    backend_commit: str = Field(min_length=1)
+    backend_commit: Ident
     """The backend commit hash."""
 
     strategy_kind: Literal["TwoPhaseMeta", "Botorch"]
     """The strategy kind, aligned with ``strategyConfig.kind``."""
 
-    hyperparameters: dict[str, Any] = Field(default_factory=dict)
+    hyperparameters: Annotated[dict[str, Any], AfterValidator(_freeze_dict)] = Field(
+        default_factory=_FrozenDict
+    )
     """The concrete hyperparameter values expanded from the strategy config."""
 
-    acquisition_function: str = Field(min_length=1)
+    acquisition_function: Ident
     """The acquisition function used."""
 
     seed: int
@@ -813,19 +968,19 @@ class AlgorithmConfig(_FrozenBase):
 class RecommendationCandidate(_FrozenBase):
     """A single proposed parameter configuration."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier."""
 
-    parameter_values: dict[str, str | float]
+    parameter_values: Annotated[dict[str, str | Finite], AfterValidator(_freeze_dict)]
     """The proposed value for each parameter id."""
 
-    predicted_mean: dict[str, float] | None = None
+    predicted_mean: Annotated[dict[str, Finite] | None, AfterValidator(_freeze_dict)] = None
     """The per-output predicted mean; ``None`` for model-free initial design."""
 
-    predicted_sd: dict[str, float] | None = None
+    predicted_sd: Annotated[dict[str, Finite] | None, AfterValidator(_freeze_dict)] = None
     """The per-output predicted standard deviation, when available."""
 
-    desirability: float | None = None
+    desirability: Finite | None = None
     """The scalar desirability, when a Desirability objective applies."""
 
 
@@ -841,17 +996,17 @@ class BatchStatus(StrEnum):
 class RecommendationBatch(_Base):
     """A persisted batch of candidates assembled by the application service."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier."""
 
-    campaign_run_id: str = Field(min_length=1)
+    campaign_run_id: Ident
     """The owning :class:`CampaignRun` id."""
 
     round_number: int = Field(ge=1)
     """The round number (1 for initial design, ``run.round + 1`` after)."""
 
-    generated_at: str
-    """The ISO-8601 generation timestamp."""
+    generated_at: AwareDatetime
+    """The timezone-aware generation timestamp."""
 
     input_snapshot: dict[str, Any]
     """The deep-copied, self-contained inputs used to generate the batch."""
@@ -859,7 +1014,7 @@ class RecommendationBatch(_Base):
     algorithm_config: AlgorithmConfig
     """The resolved algorithm configuration."""
 
-    candidates: list[RecommendationCandidate] = Field(min_length=1)
+    candidates: Annotated[list[RecommendationCandidate], AfterValidator(_freeze_list), Field(min_length=1)]
     """The candidates; length equals the effective batch size."""
 
     status: BatchStatus
@@ -892,25 +1047,25 @@ class DecisionAction(StrEnum):
 class DecisionLog(_FrozenBase):
     """An append-only audit record of a decision on a campaign run."""
 
-    id: str = Field(min_length=1)
+    id: Ident
     """The stable identifier."""
 
-    campaign_run_id: str = Field(min_length=1)
+    campaign_run_id: Ident
     """The owning :class:`CampaignRun` id."""
 
-    timestamp: str
-    """The ISO-8601 timestamp of the action."""
+    timestamp: AwareDatetime
+    """The timezone-aware timestamp of the action."""
 
-    actor: str = Field(min_length=1)
+    actor: Ident
     """The actor: a user id, ``agent:<name>``, or ``system``."""
 
     action: DecisionAction
     """The recorded action."""
 
-    definition_revision_id: str = Field(min_length=1)
+    definition_revision_id: Ident
     """The revision the action pertains to."""
 
-    payload: dict[str, Any] | None = None
+    payload: Annotated[dict[str, Any] | None, AfterValidator(_freeze_dict)] = None
     """The optional structured payload."""
 
     related_entity_id: str | None = None
@@ -940,6 +1095,8 @@ __all__ = [
     "ExperimentRound",
     "ExperimentRun",
     "ExperimentRunStatus",
+    "Finite",
+    "Ident",
     "LinearEqualityConstraintSpec",
     "LinearInequalityConstraintSpec",
     "Measurement",
@@ -949,6 +1106,7 @@ __all__ = [
     "OutputSpec",
     "ParameterSpec",
     "ParetoObjectivePolicy",
+    "PositiveFinite",
     "RecommendationBatch",
     "RecommendationCandidate",
     "RoundStatus",

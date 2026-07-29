@@ -247,9 +247,9 @@ def _validate_objective_policy(
                         related_entity_id=entry.target_id,
                     )
                 )
-        if policy.weighting_mode is WeightingMode.EQUAL:
-            weights = {e.weight for e in policy.entries}
-            if len(weights) > 1:
+        if policy.weighting_mode is WeightingMode.EQUAL and policy.entries:
+            weights = [e.weight for e in policy.entries]
+            if max(weights) - min(weights) > TOLERANCE:
                 issues.append(
                     ValidationIssue(
                         code="DESIRABILITY_WEIGHTS_NOT_EQUAL",
@@ -262,6 +262,17 @@ def _validate_objective_policy(
         for target_id in policy.target_ids:
             if target_id not in target_ids:
                 _unknown(target_id)
+        if set(policy.target_ids) != target_ids or len(policy.target_ids) != len(
+            revision.targets
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="PARETO_COVERAGE",
+                    message="Pareto target ids must cover every target exactly "
+                    "once.",
+                    severity=Severity.BLOCKING,
+                )
+            )
 
     return issues
 
@@ -271,16 +282,32 @@ def _validate_constraint_executability(
 ) -> list[ValidationIssue]:
     """Derive whether each constraint is currently executable (§2.8)."""
     issues: list[ValidationIssue] = []
-    parameter_ids = {p.id for p in revision.parameters}
+    parameters = {p.id: p for p in revision.parameters}
 
     for constraint in revision.constraints:
-        missing = [pid for pid in constraint.parameter_ids if pid not in parameter_ids]
+        missing = [pid for pid in constraint.parameter_ids if pid not in parameters]
         if missing:
             issues.append(
                 ValidationIssue(
                     code="CONSTRAINT_UNKNOWN_PARAMETER",
                     message=f"Constraint {constraint.id!r} references unknown "
                     f"parameter(s) {missing}.",
+                    severity=Severity.BLOCKING,
+                    related_entity_id=constraint.id,
+                )
+            )
+        non_numeric = [
+            pid
+            for pid in constraint.parameter_ids
+            if isinstance(parameters.get(pid), CategoricalParameterSpec)
+        ]
+        if non_numeric:
+            issues.append(
+                ValidationIssue(
+                    code="CONSTRAINT_NON_NUMERIC_PARAMETER",
+                    message=f"Constraint {constraint.id!r} references non-numeric "
+                    f"parameter(s) {non_numeric}; linear and cardinality "
+                    "constraints require continuous or discrete parameters.",
                     severity=Severity.BLOCKING,
                     related_entity_id=constraint.id,
                 )
@@ -425,6 +452,16 @@ def _validate_candidate_constraints(
                     code="CANDIDATE_CONSTRAINT_VIOLATED",
                     message=f"Candidate {candidate.id!r} violates constraint "
                     f"{constraint.id!r}.",
+                    severity=Severity.BLOCKING,
+                    related_entity_id=candidate.id,
+                )
+            )
+        elif satisfied is None:
+            issues.append(
+                ValidationIssue(
+                    code="CANDIDATE_CONSTRAINT_UNDECIDABLE",
+                    message=f"Constraint {constraint.id!r} cannot be evaluated for "
+                    f"candidate {candidate.id!r} (missing or non-numeric value).",
                     severity=Severity.BLOCKING,
                     related_entity_id=candidate.id,
                 )
