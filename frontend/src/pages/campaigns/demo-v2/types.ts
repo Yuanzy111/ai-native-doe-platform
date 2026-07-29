@@ -1,0 +1,88 @@
+export type StageKey =
+  | 'objective'
+  | 'design-space'
+  | 'historical-data'
+  | 'recommendations'
+  | 'execution'
+  | 'analysis'
+  | 'decision-log'
+
+export interface Stage {
+  key: StageKey
+  label: string
+}
+
+export type ParameterType = 'Continuous' | 'Discrete' | 'Categorical'
+
+interface ParameterBase {
+  id: string
+  name: string
+  unit: string
+  description: string
+}
+
+export interface ContinuousParameter extends ParameterBase {
+  type: 'Continuous'
+  lowerBound: string
+  upperBound: string
+}
+
+export interface ValuesParameter extends ParameterBase {
+  type: 'Discrete' | 'Categorical'
+  values: string[]
+}
+
+export type Parameter = ContinuousParameter | ValuesParameter
+
+export interface ParameterFieldErrors {
+  name?: string
+  bounds?: string
+  values?: string
+}
+
+export interface Objective {
+  id: string
+  name: string
+  direction: 'Maximize' | 'Minimize'
+  unit: string
+  description: string
+}
+
+export interface ObjectiveFieldErrors {
+  name?: string
+}
+
+export type ConstraintChoice = 'fixed-sum' | 'no-constraint' | 'custom'
+
+export interface ConstraintState {
+  choice: ConstraintChoice | null
+  customExpression: string
+}
+
+export interface CampaignData {
+  breadcrumb: string[]
+  title: string
+  status: 'Draft' | 'Active' | 'Completed'
+  round: number
+  budgetUsed: number
+  budgetTotal: number
+  batchSize: number
+  goal: string
+  openConstraintQuestion: string
+  copilot: {
+    experimentSummary: string
+    constraintMissingInfo: string
+    optionalPreferences: string[]
+    suggestedNextStepPending: string
+    suggestedNextStepResolved: string
+    pendingConstraint: string
+  }
+}
+
+export type ToastVariant = 'success' | 'warning' | 'info'
+
+export interface Toast {
+  id: string
+  variant: ToastVariant
+  message: string
+}

@@ -1,0 +1,29 @@
+# Vendored external clones (published in their own upstream repos)
+baybe/
+bofire/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / frontend
+node_modules/
+dist/
+build/
+.vite/
+
+# Logs & caches
+*.log
+logs/
+.cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
