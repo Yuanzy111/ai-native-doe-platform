@@ -68,6 +68,7 @@ from backend.domain.models import (
 )
 
 _SEED_UPPER_BOUND = 2**31
+_BACKEND_NAME = "baybe"
 
 
 class BayBEAdapter:
@@ -105,6 +106,12 @@ class BayBEAdapter:
             AdapterComputationError: BayBE failed while sampling, or returned the
                 wrong number of candidates.
         """
+        if policy.backend_name != _BACKEND_NAME:
+            raise AdapterValidationError(
+                f"This adapter only serves the {_BACKEND_NAME!r} backend, but the "
+                f"policy requests backend {policy.backend_name!r}. Refusing to run "
+                "BayBE for another backend's policy."
+            )
         specs_by_id = {spec.id: spec for spec in revision.parameters}
         searchspace = self._build_searchspace(revision, specs_by_id)
         recommender, recommender_name = self._select_recommender(policy, searchspace)
@@ -194,11 +201,11 @@ class BayBEAdapter:
         if name == "RandomRecommender":
             return RandomRecommender(), name
         if name == "FPSRecommender":
-            if searchspace.type is SearchSpaceType.CONTINUOUS:
+            if searchspace.type is not SearchSpaceType.DISCRETE:
                 raise UnsupportedFeatureError(
-                    "FPSRecommender requires discrete candidates, but the "
-                    "resolved search space is fully continuous. Refusing to "
-                    "silently fall back to a different recommender."
+                    "FPSRecommender requires a fully discrete search space, but "
+                    f"the resolved space is {searchspace.type.value!r}. Refusing "
+                    "to silently fall back to a different recommender."
                 )
             return FPSRecommender(), name
         raise UnsupportedFeatureError(
@@ -220,7 +227,7 @@ class BayBEAdapter:
         """Record the resolved, reproducible algorithm configuration."""
         strategy = policy.strategy_config
         return AlgorithmConfig(
-            backend_name=policy.backend_name or "baybe",
+            backend_name=_BACKEND_NAME,
             backend_version=_baybe_version(),
             backend_commit=_baybe_commit(),
             strategy_kind=strategy.kind,
@@ -242,7 +249,7 @@ class BayBEAdapter:
             "revisionId": revision.id,
             "revisionNumber": revision.revision_number,
             "policyId": policy.id,
-            "backendName": policy.backend_name or "baybe",
+            "backendName": _BACKEND_NAME,
             "batchSize": policy.batch_size,
             "seed": seed,
             "recommender": recommender_name,

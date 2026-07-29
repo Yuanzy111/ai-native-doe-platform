@@ -8,7 +8,7 @@ service.
 
 import pytest
 
-from backend.adapters.errors import UnsupportedFeatureError
+from backend.adapters.errors import AdapterValidationError, UnsupportedFeatureError
 from backend.application import ApplicationService
 from backend.domain import models as m
 from backend.domain.validation import validate_candidates
@@ -46,9 +46,10 @@ def _two_phase(initial_recommender="RandomRecommender"):
     )
 
 
-def _policy(strategy, batch_size=3, seed_value=42):
+def _policy(strategy, batch_size=3, seed_value=42, backend_name="baybe"):
     return m.OptimizationPolicy(
         id="op-b",
+        backend_name=backend_name,
         batch_size=batch_size,
         seed_policy=m.SeedPolicy.FIXED,
         seed_value=seed_value,
@@ -67,6 +68,13 @@ def _discrete():
     return [
         m.DiscreteParameterSpec(id="a", name="Level A", values=[0, 10, 20, 30]),
         m.DiscreteParameterSpec(id="b", name="Level B", values=[0, 10, 20, 30]),
+    ]
+
+
+def _hybrid():
+    return [
+        m.ContinuousParameterSpec(id="resin", name="Resin", bounds=m.Bounds(lower=0, upper=100)),
+        m.DiscreteParameterSpec(id="a", name="Level A", values=[0, 10, 20, 30]),
     ]
 
 
@@ -230,12 +238,47 @@ class TestUnsupportedInputsFailExplicitly:
                 revision, _policy(_two_phase("FPSRecommender"))
             )
 
+    def test_incompatible_fps_hybrid_fails(self, baybe_adapter):
+        # FPS needs a fully discrete space; a hybrid space is incompatible and
+        # must be rejected up front, not left to fail inside BayBE.
+        revision = _revision(_hybrid())
+        with pytest.raises(UnsupportedFeatureError):
+            baybe_adapter.generate_initial_design(
+                revision, _policy(_two_phase("FPSRecommender"))
+            )
+
+    def test_wrong_backend_fails(self, baybe_adapter):
+        # A policy addressed to another backend must be rejected before BayBE
+        # is ever invoked.
+        revision = _revision(_continuous())
+        with pytest.raises(AdapterValidationError):
+            baybe_adapter.generate_initial_design(
+                revision, _policy(_two_phase(), backend_name="bofire")
+            )
+
     def test_direct_botorch_coldstart_fails(self, baybe_adapter):
         # A direct Botorch strategy has no cold-start phase for the initial design.
         revision = _revision(_continuous())
         botorch = m.BotorchConfig(acquisition_function="qLogEI")
         with pytest.raises(UnsupportedFeatureError):
             baybe_adapter.generate_initial_design(revision, _policy(botorch))
+
+
+class TestRecommenderSelection:
+    """The cold-start recommender is chosen from the strategy config."""
+
+    def test_fps_discrete_generates_candidates(self, baybe_adapter):
+        revision = _revision(_discrete())
+        result = baybe_adapter.generate_initial_design(
+            revision, _policy(_two_phase("FPSRecommender"), batch_size=3)
+        )
+
+        allowed = {0.0, 10.0, 20.0, 30.0}
+        assert len(result.candidates) == 3
+        for candidate in result.candidates:
+            assert candidate.parameter_values["a"] in allowed
+            assert candidate.parameter_values["b"] in allowed
+        assert validate_candidates(revision, result.candidates).ok is True
 
 
 class TestOutputContract:
@@ -316,6 +359,23 @@ class TestApplicationServiceIntegration:
         service = ApplicationService(repo, adapter=baybe_adapter)
 
         with pytest.raises(UnsupportedFeatureError):
+            service.generate_initial_design("run-1", actor="user-1")
+
+        assert repo.list_batches("run-1") == []
+        assert repo.list_rounds("run-1") == []
+        assert repo.list_experiment_runs_for_run("run-1") == []
+        assert repo.get_run("run-1").status is m.RunStatus.DESIGN_SPACE_VALIDATED
+
+    def test_wrong_backend_leaves_no_batch_round_or_experiment(
+        self, repo, make_definition, make_revision, make_run, baybe_adapter
+    ):
+        # A policy addressed to another backend makes the BayBE adapter reject
+        # the request; the whole transaction must roll back with nothing written.
+        policy = _policy(_two_phase(), batch_size=4, backend_name="bofire")
+        self._seed_validated_run(repo, make_definition, make_revision, make_run, policy)
+        service = ApplicationService(repo, adapter=baybe_adapter)
+
+        with pytest.raises(AdapterValidationError):
             service.generate_initial_design("run-1", actor="user-1")
 
         assert repo.list_batches("run-1") == []

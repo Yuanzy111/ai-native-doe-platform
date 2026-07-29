@@ -7,8 +7,9 @@ into a :class:`RecommendationResult` — the candidates plus the resolved,
 reproducible algorithm configuration and the self-contained input snapshot the
 service persists onto a :class:`~backend.domain.models.RecommendationBatch`.
 
-No production adapter (BayBE/BoTorch) is implemented yet; the only concrete
-implementation lives in the test suite, so the closed loop can be exercised
+The production :class:`~backend.adapters.baybe.BayBEAdapter` implements the
+initial-design leg of this protocol against real BayBE; a lightweight fake in
+the test suite covers the later legs so the closed loop can still be exercised
 end-to-end without pulling in a heavyweight optimizer.
 """
 
