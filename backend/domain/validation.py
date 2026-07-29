@@ -30,6 +30,8 @@ from backend.domain.models import (
     ContinuousParameterSpec,
     DesirabilityObjectivePolicy,
     DiscreteParameterSpec,
+    ExperimentRun,
+    ExperimentRunStatus,
     LinearEqualityConstraintSpec,
     LinearInequalityConstraintSpec,
     Measurement,
@@ -86,6 +88,38 @@ class ValidationResult(BaseModel):
     def ok(self) -> bool:
         """Whether no blocking issue is present."""
         return not any(i.severity is Severity.BLOCKING for i in self.issues)
+
+    @property
+    def blocking_issues(self) -> tuple[ValidationIssue, ...]:
+        """The subset of issues with blocking severity."""
+        return tuple(i for i in self.issues if i.severity is Severity.BLOCKING)
+
+
+class ReadinessResult(BaseModel):
+    """Whether a round's Completed experiments yield closable data (§3.5, §4).
+
+    Readiness is assembled *per experiment*: an experiment contributes a usable
+    data row only if it alone carries an active valid reading for every output
+    the objective covers. Readings are never stitched across experiments, so a
+    Completed experiment that is missing any covered output is *incomplete* and
+    blocks closing by default.
+    """
+
+    model_config = ConfigDict(
+        alias_generator=to_camel, populate_by_name=True, frozen=True
+    )
+
+    ready: bool
+    """Whether the round may be closed: at least one usable row, none incomplete."""
+
+    usable_experiment_run_ids: tuple[str, ...] = ()
+    """Completed experiments that carry every covered output (one usable row each)."""
+
+    incomplete_experiment_run_ids: tuple[str, ...] = ()
+    """Completed experiments missing at least one covered output's active reading."""
+
+    issues: tuple[ValidationIssue, ...] = ()
+    """The blocking findings explaining why the round is (not) ready."""
 
     @property
     def blocking_issues(self) -> tuple[ValidationIssue, ...]:
@@ -354,8 +388,29 @@ def validate_candidates(
             _validate_candidate_constraints(revision, candidate)
         )
 
+    issues.extend(_validate_candidate_id_uniqueness(candidates))
     issues.extend(_validate_candidate_duplicates(revision, candidates))
     return ValidationResult(issues=tuple(issues))
+
+
+def _validate_candidate_id_uniqueness(
+    candidates: list[RecommendationCandidate],
+) -> list[ValidationIssue]:
+    """Flag any candidate id that appears more than once in the batch (§4.1)."""
+    issues: list[ValidationIssue] = []
+    counts = Counter(candidate.id for candidate in candidates)
+    for candidate_id, count in counts.items():
+        if count > 1:
+            issues.append(
+                ValidationIssue(
+                    code="DUPLICATE_CANDIDATE_ID",
+                    message=f"Candidate id {candidate_id!r} appears {count} times; "
+                    "candidate ids must be unique within a batch.",
+                    severity=Severity.BLOCKING,
+                    related_entity_id=candidate_id,
+                )
+            )
+    return issues
 
 
 def _validate_candidate_values(
@@ -673,37 +728,81 @@ def _objective_output_ids(revision: CampaignDefinitionRevision) -> set[str]:
 
 
 def assess_readiness(
-    revision: CampaignDefinitionRevision, measurements: list[Measurement]
-) -> ValidationResult:
-    """Judge whether a round has enough valid readings to close (§4).
+    revision: CampaignDefinitionRevision,
+    experiment_runs: list[ExperimentRun],
+    measurements: list[Measurement],
+) -> ReadinessResult:
+    """Judge whether a round's Completed experiments yield closable data (§3.5).
 
-    Closing a round requires an active (valid, non-superseded) measurement for
-    every output the objective depends on: the single target's output for a
-    ``Single`` objective, and each covered target's output for ``Desirability``
-    and ``Pareto``. This is computed by the service, never asserted by the
-    caller, so a round cannot be closed before its results actually exist.
+    A usable data row is assembled *per experiment*: a ``Completed`` experiment
+    contributes one row only if it alone carries an active (valid,
+    non-superseded) reading for every output the objective covers — the single
+    target's output for ``Single``, and each covered target's output for
+    ``Desirability``/``Pareto``. Readings are never combined across experiments,
+    so a Completed experiment missing any covered output is *incomplete*.
+
+    The round is ready to close only when at least one usable row exists and no
+    Completed experiment is incomplete. ``Failed``/``Cancelled``/``Pending``
+    experiments never contribute a row. This is computed by the service, never
+    asserted by the caller.
 
     Args:
         revision: The run's pinned definition revision.
+        experiment_runs: The round's experiment runs.
         measurements: The measurements recorded for the round's experiments.
 
     Returns:
-        A :class:`ValidationResult`; a missing active reading for any required
-        output is blocking, so ``ok`` is the readiness verdict.
+        A :class:`ReadinessResult` with the readiness verdict, the usable and
+        incomplete experiment ids, and the blocking issues.
     """
     required = _objective_output_ids(revision)
-    observed = {m.output_id for m in active_measurements(measurements)}
-    issues = [
-        ValidationIssue(
-            code="OUTPUT_NOT_MEASURED",
-            message=f"Output {output_id!r} has no valid reading; the round is "
-            "not ready to close.",
-            severity=Severity.BLOCKING,
-            related_entity_id=output_id,
+    observed_by_experiment: dict[str, set[str]] = {}
+    for measurement in active_measurements(measurements):
+        observed_by_experiment.setdefault(
+            measurement.experiment_run_id, set()
+        ).add(measurement.output_id)
+
+    usable: list[str] = []
+    incomplete: list[str] = []
+    issues: list[ValidationIssue] = []
+    for experiment in experiment_runs:
+        if experiment.status is not ExperimentRunStatus.COMPLETED:
+            continue
+        observed = observed_by_experiment.get(experiment.id, set())
+        missing = required - observed
+        if missing:
+            incomplete.append(experiment.id)
+            issues.append(
+                ValidationIssue(
+                    code="INCOMPLETE_EXPERIMENT_RESULT",
+                    message=f"Completed experiment {experiment.id!r} is missing an "
+                    f"active reading for output(s) {sorted(missing)}; the round "
+                    "cannot close while a Completed experiment is incomplete.",
+                    severity=Severity.BLOCKING,
+                    related_entity_id=experiment.id,
+                )
+            )
+        else:
+            usable.append(experiment.id)
+
+    if not usable:
+        issues.append(
+            ValidationIssue(
+                code="NO_USABLE_DATA_ROW",
+                message="The round has no Completed experiment with a full set of "
+                "covered-output readings; at least one usable data row is required "
+                "to close.",
+                severity=Severity.BLOCKING,
+            )
         )
-        for output_id in sorted(required - observed)
-    ]
-    return ValidationResult(issues=tuple(issues))
+
+    ready = not any(i.severity is Severity.BLOCKING for i in issues)
+    return ReadinessResult(
+        ready=ready,
+        usable_experiment_run_ids=tuple(usable),
+        incomplete_experiment_run_ids=tuple(incomplete),
+        issues=tuple(issues),
+    )
 
 
 def validate_supersede_chains(measurements: list[Measurement]) -> ValidationResult:
@@ -892,6 +991,7 @@ def _detect_supersede_cycles(
 
 
 __all__ = [
+    "ReadinessResult",
     "RunEvent",
     "Severity",
     "StateTransitionError",

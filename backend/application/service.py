@@ -63,6 +63,12 @@ _TERMINAL_EXPERIMENT = {
 _EDITABLE_STATUSES = {RunStatus.DRAFT, RunStatus.DESIGN_SPACE_VALIDATED}
 """The run states in which the policy/pinned revision may still be edited (§3.6)."""
 
+_MEASURABLE_STATUSES = {
+    RunStatus.RECOMMENDATIONS_PENDING,
+    RunStatus.AWAITING_MEASUREMENTS,
+}
+"""The run states in which measurements may still be recorded (§3.5)."""
+
 
 class ServiceError(Exception):
     """Raised when an application-level invariant is violated."""
@@ -285,6 +291,7 @@ class ApplicationService:
             )
         with self._repo.transaction():
             run = self._require_run(run_id)
+            self._assert_initial_design_preconditions(run)
             revision = self._repo.get_revision(run.definition_revision_id)
             if revision is None:
                 raise ServiceError(
@@ -408,6 +415,12 @@ class ApplicationService:
             )
         with self._repo.transaction():
             run = self._require_run(run_id)
+            if run.status is not RunStatus.RECOMMENDATIONS_PENDING:
+                raise ServiceError(
+                    "Experiment results may only be recorded while the run is "
+                    f"RecommendationsPending; run {run_id!r} is "
+                    f"{run.status.value!r}."
+                )
             experiment = self._repo.get_experiment_run(experiment_run_id)
             if experiment is None:
                 raise ServiceError(
@@ -417,6 +430,23 @@ class ApplicationService:
                 raise ServiceError(
                     f"Experiment run {experiment_run_id!r} does not belong to run "
                     f"{run_id!r}."
+                )
+            experiment_round = self._repo.get_round(experiment.experiment_round_id)
+            if experiment_round is None:
+                raise ServiceError(
+                    "Cannot resolve the round for experiment run "
+                    f"{experiment_run_id!r}."
+                )
+            if experiment_round.status is not RoundStatus.OPEN:
+                raise ServiceError(
+                    f"Round {experiment_round.id!r} is closed; its experiment "
+                    "results are frozen."
+                )
+            if experiment.status is not ExperimentRunStatus.PENDING:
+                raise ServiceError(
+                    f"Experiment run {experiment_run_id!r} is already "
+                    f"{experiment.status.value!r}; a terminal result cannot be "
+                    "overwritten."
                 )
             self._assert_candidate_consistent(experiment)
             updated = experiment.model_copy(
@@ -463,6 +493,11 @@ class ApplicationService:
             ServiceError: If the experiment run or its campaign run is unknown.
             PersistenceError: If the output or supersede chain is invalid.
         """
+        if measurement.recorded_by != actor:
+            raise ServiceError(
+                "measurement.recordedBy must equal the recording actor "
+                f"({measurement.recorded_by!r} != {actor!r})."
+            )
         with self._repo.transaction():
             experiment = self._repo.get_experiment_run(measurement.experiment_run_id)
             if experiment is None:
@@ -475,6 +510,28 @@ class ApplicationService:
                 raise ServiceError(
                     "Cannot resolve the campaign run for experiment run "
                     f"{experiment.id!r}."
+                )
+            if run.status not in _MEASURABLE_STATUSES:
+                raise ServiceError(
+                    "Measurements may only be recorded while the run is "
+                    "RecommendationsPending or AwaitingMeasurements; run "
+                    f"{run.id!r} is {run.status.value!r}."
+                )
+            experiment_round = self._repo.get_round(experiment.experiment_round_id)
+            if experiment_round is None:
+                raise ServiceError(
+                    "Cannot resolve the round for experiment run "
+                    f"{experiment.id!r}."
+                )
+            if experiment_round.status is not RoundStatus.OPEN:
+                raise ServiceError(
+                    f"Round {experiment_round.id!r} is closed; measurements are "
+                    "frozen."
+                )
+            if experiment.status is not ExperimentRunStatus.COMPLETED:
+                raise ServiceError(
+                    "Measurements may only be recorded for Completed experiments; "
+                    f"experiment {experiment.id!r} is {experiment.status.value!r}."
                 )
             self._repo.add_measurement(measurement)
             action = (
@@ -587,11 +644,12 @@ class ApplicationService:
                     f"Run {run_id!r} pins unknown revision "
                     f"{run.definition_revision_id!r}."
                 )
+            experiments = self._repo.list_experiment_runs(round_id)
             measurements: list[Measurement] = []
-            for experiment in self._repo.list_experiment_runs(round_id):
+            for experiment in experiments:
                 measurements.extend(self._repo.list_measurements(experiment.id))
-            readiness = assess_readiness(revision, measurements)
-            if not readiness.ok:
+            readiness = assess_readiness(revision, experiments, measurements)
+            if not readiness.ready:
                 raise ServiceError(
                     f"Round {round_id!r} is not ready to close: "
                     f"{self._codes(readiness)}."
@@ -868,6 +926,46 @@ class ApplicationService:
                 )
             )
         return updated
+
+    def _assert_initial_design_preconditions(self, run: CampaignRun) -> None:
+        """Guard the initial-design gate so the adapter is only called when valid.
+
+        Every precondition is checked before the optimizer adapter is invoked: a
+        failure here means the adapter is never called and nothing is persisted.
+        """
+        if run.status is not RunStatus.DESIGN_SPACE_VALIDATED:
+            raise ServiceError(
+                f"generate_initial_design requires a DesignSpaceValidated run; "
+                f"run {run.id!r} is {run.status.value!r}."
+            )
+        if run.round != 0:
+            raise ServiceError(
+                f"generate_initial_design is only for the first round; run "
+                f"{run.id!r} already has round={run.round}."
+            )
+        if self._repo.list_batches(run.id):
+            raise ServiceError(
+                f"Run {run.id!r} already has a recommendation batch; the initial "
+                "design has already been generated."
+            )
+        open_rounds = [
+            experiment_round
+            for experiment_round in self._repo.list_rounds(run.id)
+            if experiment_round.status is RoundStatus.OPEN
+        ]
+        if open_rounds:
+            raise ServiceError(
+                f"Run {run.id!r} has an open round "
+                f"{[r.id for r in open_rounds]}; cannot generate an initial design."
+            )
+        batch_size = run.optimization_policy.batch_size
+        remaining = run.budget_total - run.budget_used
+        if batch_size > remaining:
+            raise ServiceError(
+                f"Policy batchSize {batch_size} exceeds the remaining budget "
+                f"{remaining} (budgetTotal={run.budget_total}, "
+                f"budgetUsed={run.budget_used})."
+            )
 
     def _assert_candidate_consistent(self, experiment: ExperimentRun) -> None:
         """Assert an experiment's candidate/values still match its batch (§2.11)."""

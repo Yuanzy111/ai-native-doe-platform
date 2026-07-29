@@ -176,6 +176,16 @@ class TestValidateCandidates:
         ]
         assert "CANDIDATE_DUPLICATE" in _codes(validate_candidates(fixed_sum_revision, candidates))
 
+    def test_duplicate_candidate_id_is_blocking(self, fixed_sum_revision):
+        candidates = [
+            m.RecommendationCandidate(id="cand-1", parameter_values={"resin": 60.0, "hard": 40.0}),
+            m.RecommendationCandidate(id="cand-1", parameter_values={"resin": 30.0, "hard": 70.0}),
+        ]
+        codes = _codes(validate_candidates(fixed_sum_revision, candidates))
+        assert "DUPLICATE_CANDIDATE_ID" in codes
+        # Distinct vectors, so the parameter-duplicate rule must NOT also fire.
+        assert "CANDIDATE_DUPLICATE" not in codes
+
     def test_type_mismatch_is_blocking(self, make_revision):
         revision = make_revision(
             parameters=[m.CategoricalParameterSpec(id="cat", name="Catalyst", values=["A", "B"])],

@@ -327,10 +327,11 @@ interface BotorchConfig {
 | `campaignRunId` | string | ✓ | |
 | `roundNumber` | number (int, ≥1) | ✓ | 与 `RecommendationBatch.roundNumber` 一一对应 |
 | `recommendationBatchId` | string | ✓ | |
-| `experimentRunIds` | array<string> | ✓ | 初始为空,随执行增长 |
 | `openedAt` | string (ISO-8601) | ✓ | |
 | `closedAt` | string (ISO-8601)? | — | |
 | `status` | enum(`Open`,`Closed`) | ✓ | |
+
+**去规范化的 `experimentRunIds` 已删除(v0.2)**:轮次不再持有实验 id 数组;归属由 `ExperimentRun.experimentRoundId` 单向引用,查询经 `list_experiment_runs(roundId)` 派生,避免双写不一致。
 
 **关闭条件(v0.2 细化)**:该轮全部 `ExperimentRun.status ∈ {Completed, Failed, Cancelled}`(物理执行完/放弃),**且**通过 partial-measurement gating(§3/§4)——即"结果已就绪到足以支撑下一轮 `recommend()`"。这对应新的 `AwaitingMeasurements` 中间态。
 
@@ -493,17 +494,17 @@ Archived --(终态,无出边)--
 
 ### 3.5 结果就绪门禁(assess_readiness,对应 req 10 + 本次 req 3/7)
 
-`AwaitingMeasurements → RoundClosed`(以及随后 `recommend()`)前,由 `assess_readiness(revision, optimization_policy, experiment_runs, measurements)`(§4)**实时判定**,而非比对静态能力常量(v0.1 的 `supportsPartialMeasurements`/`minObservationsForRecommend` 已删除,见 §4):
+`AwaitingMeasurements → RoundClosed`(以及随后 `recommend()`)前,由**领域函数** `assess_readiness(revision, experiment_runs, measurements)`(§4)**实时判定**,而非比对静态能力常量(v0.1 的 `supportsPartialMeasurements`/`minObservationsForRecommend` 已删除,见 §4)。objectivePolicy 取自 `revision`,故无需单独传 `optimization_policy`;`experiment_runs`/`measurements` 均为**当前轮**的集合:
 
-- Adapter 依**实际的** `objectivePolicy` 决定"完整行"口径:对每个已 `Completed` 的 `ExperimentRun` 组装一行"参数值 + 各 target 活跃读数";Desirability/Pareto 需其覆盖的全部 target 均有活跃 Valid 读数才算完整行,Single 只需被引用的那个 target。MVP BayBE 标量化 Desirability 不接受缺失 target,故"只测 2/4 目标"的行被排除——这正是 §8 示例停在 `AwaitingMeasurements` 的原因。
-- Adapter 依 `strategyConfig` 决定最小可用观测数(TwoPhaseMeta 冷启动阶段与 BO 阶段阈值不同),返回 `{ ready, usableRowCount, issues }`。
+- 依**实际的** `revision.objectivePolicy` 决定"完整行"口径:**逐个** `ExperimentRun` 组装一行"参数值 + 各 target 活跃读数";Desirability/Pareto 需其覆盖的全部 target 均有活跃 Valid 读数才算完整行,Single 只需被引用的那个 target。**不跨实验拼接**(不得用实验 A 的 output1 补实验 B 的 output2)。`Failed`/`Cancelled` 实验不构成可用行。MVP BayBE 标量化 Desirability 不接受缺失 target,故"只测 2/4 目标"的行被排除——这正是 §8 示例停在 `AwaitingMeasurements` 的原因。
+- 至少需 1 行完整可用行;**默认**任何"已 `Completed` 但读数不全"的实验都会阻止关轮(记入 `incompleteExperimentRunIds` 并给出 `INCOMPLETE_EXPERIMENT_RESULT`)。无任何可用行时给出 `NO_USABLE_DATA_ROW`。`ready = 无阻塞 issue`。
 - `close_round()` 门禁:`ready=false` 时拒绝关轮并透传 `issues`("有效观测不足,请补齐读数、取消候选或作废本轮")。
 - Agent/LLM 不得绕过该门禁强制关轮(§6)。
 
 **避免 AwaitingMeasurements 死锁(本次 req 7)**:若个别候选永远测不出(实验失败/样品报废/成本过高而放弃),`ready` 会一直为 false,Run 卡死在 `AwaitingMeasurements`。为此提供两条**显式**逃生路径,均须真实用户触发并留痕,Agent 不得代为决定(§6):
 
 - `abort_round()`:**放弃当前轮**。把本轮未完成的 `ExperimentRun` 置 `Cancelled`、`RecommendationBatch.status='Superseded'`、`ExperimentRound` 关闭且标记"无有效产出",Run 回到 `RoundClosed`(可据已有完整行再 `recommend()`,或 `mark_completed()`)。写 `DecisionLog(action='RoundAborted')`。
-- `close_round(discard_incomplete=true)`:在"已有足够完整行、只是个别候选读数残缺"时,**显式丢弃残缺观测行**(它们不进入 `recommend()` 入模数据,但作为历史 `Measurement` 永久保留),用剩余完整行通过 gating 正常关轮。写 `DecisionLog(action='RoundClosed', payload.discardedIncomplete=true)`。
+- `close_round(discard_incomplete=true)`(**当前 MVP 未实现**,以 `abort_round()` 替代):在"已有足够完整行、只是个别候选读数残缺"时,**显式丢弃残缺观测行**(它们不进入 `recommend()` 入模数据,但作为历史 `Measurement` 永久保留),用剩余完整行通过 gating 正常关轮。写 `DecisionLog(action='RoundClosed', payload.discardedIncomplete=true)`。
 
 二者区别:`abort_round()` 放弃整轮、不产出下一轮输入;`close_round(discard_incomplete)` 正常关轮、只排除残缺行。是否再提供"强制关轮忽略 gating"的 `force` 口子留待产品定(§9-5)。
 
@@ -597,26 +598,6 @@ class OptimizerAdapter(Protocol):
         错误: ValidationError / UnsupportedFeatureError / InsufficientDataError / ComputationError。
         """
 
-    def assess_readiness(
-        self, revision: CampaignDefinitionRevision,
-        optimization_policy: OptimizationPolicy,
-        experiment_runs: list[ExperimentRun], measurements: list[Measurement],
-    ) -> ReadinessResult:
-        """
-        输入: 同 recommend() 的数据切片(不含 batch_size/seed)。
-        输出: ReadinessResult { ready: bool, usableRowCount: int,
-                                issues: list[ValidationIssue] }。
-        语义(对应本次 req 3/7):不再依赖任何静态 capability 常量(v0.1 的
-        supportsPartialMeasurements / minObservationsForRecommend 已删除),而是基于**实际的**
-        objectivePolicy、strategyConfig 与当前数据实时计算"是否够开下一轮":
-          - 依 objectivePolicy 决定"完整行"口径:Desirability/Pareto 需其覆盖的全部 target 均有
-            活跃 Valid 读数;Single 仅需被引用的那个 target;
-          - 依 strategyConfig 决定最小可用观测数:如 TwoPhaseMeta 在 switchAfter 之前仍可由
-            initialRecommender 产出、不强求 BO 量级观测;进入 BO 阶段则需要足量完整行;
-          - usableRowCount = 依上述口径可入模的完整观测行数。
-        close_round() 门禁(§3.5)据此判定,而非比对某个后端级魔法阈值。不产生副作用。
-        """
-
     def explain(
         self, revision: CampaignDefinitionRevision,
         experiment_runs: list[ExperimentRun], measurements: list[Measurement],
@@ -642,7 +623,9 @@ class OptimizerAdapter(Protocol):
 
 `supportsCardinalityConstraint`(v0.1 布尔)已并入 `supportedConstraintKinds`(是否含 `"Cardinality"`),不再单列。
 
-**删除 `supportsPartialMeasurements` 与 `minObservationsForRecommend`(本次 req 3)**:这两个静态能力常量从 `AdapterCapabilities` **移除**。理由:"能不能用不完整的观测开下一轮"不是后端的静态属性,而取决于**具体的** objectivePolicy(Desirability/Pareto 要求全部目标齐全、Single 只需单目标)、strategyConfig(TwoPhaseMeta 冷启动阶段与 BO 阶段的最小观测量不同)与**当前实际数据**。把它压成一个布尔 + 一个魔法阈值,会在"同一后端、不同 objective/strategy/数据"时给出错误门禁。改由 `assess_readiness(revision, optimization_policy, experiment_runs, measurements)` 每次实时计算 `{ ready, usableRowCount, issues }`(见上)。`close_round()`(§3.5)直接消费该结果。
+**删除 `supportsPartialMeasurements` 与 `minObservationsForRecommend`(本次 req 3)**:这两个静态能力常量从 `AdapterCapabilities` **移除**。理由:"能不能用不完整的观测开下一轮"不是后端的静态属性,而取决于**具体的** objectivePolicy(Desirability/Pareto 要求全部目标齐全、Single 只需单目标)、strategyConfig(TwoPhaseMeta 冷启动阶段与 BO 阶段的最小观测量不同)与**当前实际数据**。把它压成一个布尔 + 一个魔法阈值,会在"同一后端、不同 objective/strategy/数据"时给出错误门禁。改由**领域函数** `assess_readiness(revision, experiment_runs, measurements)`(不属于 Adapter Protocol;见下)每次实时计算 `ReadinessResult`。`close_round()`(§3.5)直接消费该结果。
+
+**`assess_readiness` 是后端无关的领域函数(不在 Adapter Protocol 上)**:签名 `assess_readiness(revision: CampaignDefinitionRevision, experiment_runs: list[ExperimentRun], measurements: list[Measurement]) -> ReadinessResult`。objectivePolicy 取自 `revision`,故无 `optimization_policy` 形参;`experiment_runs`/`measurements` 为**当前轮**集合。语义(对应本次 req 5/6/7):**逐个** `ExperimentRun` 组装完整数据行——`SingleObjective` 需被引用 target 的活跃 Valid 读数,`Desirability`/`Pareto` 需 policy 覆盖的**全部** Output 均有活跃 Valid 读数;**不跨实验拼接**;`Failed`/`Cancelled` 不构成可用行。已 `Completed` 但读数不全的实验记入 `incompleteExperimentRunIds` 并产出 `INCOMPLETE_EXPERIMENT_RESULT`(默认阻止关轮);至少需 1 行可用,否则产出 `NO_USABLE_DATA_ROW`。`ready = 无阻塞 issue`。纯函数,无副作用。
 
 ### 4.1 Adapter 输出边界与 Application Service 职责(本次 req 2/8)
 
@@ -659,7 +642,8 @@ interface RecommendationResult {
 
 interface ReadinessResult {
   ready: boolean
-  usableRowCount: number
+  usableExperimentRunIds: string[]
+  incompleteExperimentRunIds: string[]
   issues: ValidationIssue[]
 }
 ```
@@ -882,7 +866,6 @@ interface ReadinessResult {
     "campaignRunId": "campaignrun-epoxy-coating-001",
     "roundNumber": 1,
     "recommendationBatchId": "batch-epoxy-001-r1",
-    "experimentRunIds": ["exprun-r1-1", "exprun-r1-2", "exprun-r1-3", "exprun-r1-4"],
     "openedAt": "2026-07-29T09:40:05Z",
     "closedAt": null,
     "status": "Open"
