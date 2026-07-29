@@ -1,4 +1,5 @@
 import type { CampaignData, ConstraintState, Objective, Parameter } from '../types'
+import type { ValidationIssueDto } from '../../../../api/types'
 import { getConstraintDisplayText, isConstraintResolved } from '../constraintUtils'
 import { areParametersValid } from '../parameterUtils'
 import { areObjectivesValid } from '../objectiveUtils'
@@ -11,6 +12,7 @@ interface Props {
   parameters: Parameter[]
   objectives: Objective[]
   constraint: ConstraintState
+  blockingIssues: ValidationIssueDto[]
   onAddParameter: () => void
   onEditParameter: (parameter: Parameter) => void
   onDeleteParameter: (id: string) => void
@@ -24,6 +26,7 @@ export default function MainWorkspace({
   parameters,
   objectives,
   constraint,
+  blockingIssues,
   onAddParameter,
   onEditParameter,
   onDeleteParameter,
@@ -128,6 +131,23 @@ export default function MainWorkspace({
               {unresolvedCount} unresolved question{unresolvedCount === 1 ? '' : 's'}
             </li>
           </ul>
+
+          {blockingIssues.length > 0 && (
+            <div className="mt-3 flex flex-col gap-1.5 rounded border border-red-200 bg-red-50 px-3 py-2.5">
+              <p className="text-[11px] font-medium uppercase tracking-wide text-red-600">
+                Server validation — {blockingIssues.length} blocking issue
+                {blockingIssues.length === 1 ? '' : 's'}
+              </p>
+              <ul className="flex flex-col gap-1 text-sm text-red-800">
+                {blockingIssues.map((issue) => (
+                  <li key={`${issue.code}-${issue.relatedEntityId ?? ''}-${issue.message}`}>
+                    <span className="font-mono text-xs text-red-500">{issue.code}</span>{' '}
+                    {issue.message}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </Section>
       </div>
     </main>
