@@ -788,9 +788,6 @@ class ExperimentRound(_Base):
     recommendation_batch_id: Ident
     """The originating :class:`RecommendationBatch` id."""
 
-    experiment_run_ids: list[str] = Field(default_factory=list)
-    """The experiment run ids, growing as executions are recorded."""
-
     opened_at: AwareDatetime
     """The timezone-aware timestamp the round was opened."""
 
@@ -1032,6 +1029,7 @@ class DecisionAction(StrEnum):
     CONSTRAINTS_CONFIRMED = "ConstraintsConfirmed"
     DESIGN_SPACE_VALIDATED = "DesignSpaceValidated"
     DESIGN_SPACE_VALIDATION_FAILED = "DesignSpaceValidationFailed"
+    REVISION_REPINNED = "RevisionRepinned"
     INITIAL_DESIGN_GENERATED = "InitialDesignGenerated"
     RECOMMENDATION_REQUESTED = "RecommendationRequested"
     EXPERIMENT_RUN_EXECUTED = "ExperimentRunExecuted"

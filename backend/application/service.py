@@ -6,26 +6,24 @@ counters (``round``/``budgetUsed``), and cross-aggregate ownership stay
 consistent.
 
 There is deliberately no generic ``transition(event)`` escape hatch: a caller
-cannot self-declare that a definition passed validation, that a round closed, or
-that a run completed. Instead each intent is a named method that performs the
-real work behind the corresponding event — ``validate_design_space`` actually
-runs :func:`validate_definition`, ``close_round`` actually closes the
-:class:`ExperimentRound`, ``abort_round`` actually cancels its open experiments,
-and so on — and only then applies the state transition.
+cannot self-declare that a definition passed validation, that a round is ready to
+close, or that a run completed. Instead each intent is a named method that
+performs the real work behind the corresponding event — ``validate_design_space``
+actually runs :func:`validate_definition`, ``generate_initial_design`` actually
+calls the optimizer adapter and persists the batch/round/experiments,
+``close_round`` actually calls :func:`assess_readiness`, ``abort_round`` actually
+cancels its open experiments — and only then applies the state transition.
 
-The optimizer adapter is intentionally absent, so the two events that depend on
-it (initial-design generation and recommendation) are not offered as callable
-operations yet: they must eventually run in the same transaction as the batch,
-round, and transition they produce, which cannot be assembled without the
-adapter. :meth:`ApplicationService.generate_initial_design` and
-:meth:`ApplicationService.recommend` raise :class:`NotImplementedError` to make
-that boundary explicit rather than allow a half-applied lifecycle jump.
+The optimizer boundary is an injected :class:`OptimizerAdapter`. When no adapter
+is configured the adapter-dependent operations raise :class:`NotImplementedError`
+rather than letting a caller jump the run's state on its own.
 """
 
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from backend.application.adapter import OptimizerAdapter
 from backend.domain.models import (
     BatchStatus,
     CampaignDefinition,
@@ -34,21 +32,36 @@ from backend.domain.models import (
     DecisionAction,
     DecisionLog,
     ExperimentRound,
+    ExperimentRun,
     ExperimentRunStatus,
+    Measurement,
     OptimizationPolicy,
+    RecommendationBatch,
     RoundStatus,
     RunStatus,
 )
 from backend.domain.validation import (
     RunEvent,
     ValidationResult,
+    assess_readiness,
     next_status,
+    validate_candidates,
     validate_definition,
 )
 from backend.persistence import PersistenceError, SqliteRepository
 
 _BUDGET_CONSUMING = {ExperimentRunStatus.COMPLETED, ExperimentRunStatus.FAILED}
 """The experiment-run statuses that consume one unit of budget."""
+
+_TERMINAL_EXPERIMENT = {
+    ExperimentRunStatus.COMPLETED,
+    ExperimentRunStatus.FAILED,
+    ExperimentRunStatus.CANCELLED,
+}
+"""The experiment-run statuses that count as physically finished."""
+
+_EDITABLE_STATUSES = {RunStatus.DRAFT, RunStatus.DESIGN_SPACE_VALIDATED}
+"""The run states in which the policy/pinned revision may still be edited (§3.6)."""
 
 
 class ServiceError(Exception):
@@ -63,13 +76,21 @@ def _now() -> datetime:
 class ApplicationService:
     """Coordinates run state changes over a :class:`SqliteRepository`."""
 
-    def __init__(self, repository: SqliteRepository) -> None:
-        """Bind the service to a repository.
+    def __init__(
+        self,
+        repository: SqliteRepository,
+        adapter: OptimizerAdapter | None = None,
+    ) -> None:
+        """Bind the service to a repository and an optional optimizer adapter.
 
         Args:
             repository: The persistence layer used for all reads and writes.
+            adapter: The optimizer boundary used to produce recommendations. When
+                ``None``, adapter-dependent operations raise
+                :class:`NotImplementedError`.
         """
         self._repo = repository
+        self._adapter = adapter
 
     # Campaign creation -----------------------------------------------------
 
@@ -233,46 +254,253 @@ class ApplicationService:
             run = self._require_run(run_id)
             return self._transition(run, RunEvent.EDIT_DEFINITION, actor, None)
 
-    def generate_initial_design(self, run_id: str, actor: str) -> None:
-        """Not available until the optimizer adapter exists (§4.1).
+    def generate_initial_design(
+        self, run_id: str, actor: str
+    ) -> RecommendationBatch:
+        """Generate and persist a run's first-round design in one transaction (§4.1).
 
-        Initial-design generation must persist a batch, open a round, and
-        transition the run in one transaction. That cannot be assembled without
-        the adapter, so this operation is intentionally unavailable rather than
-        letting a caller jump the run's state on its own.
+        The service validates the pinned revision and policy, asks the adapter for
+        the initial design, validates the returned candidates, and — atomically —
+        persists the batch, opens the round, files one ``Pending`` experiment per
+        candidate, advances the round counter, and transitions the run to
+        ``RecommendationsPending``. Any failure rolls the whole step back.
+
+        Args:
+            run_id: The run to generate the initial design for.
+            actor: The identity recorded in the decision log.
+
+        Returns:
+            The persisted :class:`RecommendationBatch`.
 
         Raises:
-            NotImplementedError: Always.
+            NotImplementedError: If no optimizer adapter is configured.
+            ServiceError: If the run/revision is unknown, the design space is
+                invalid, or the adapter's candidates are invalid or the wrong
+                count.
+            StateTransitionError: If the run is not ``DesignSpaceValidated``.
         """
-        raise NotImplementedError(
-            "generate_initial_design requires the optimizer adapter; it must "
-            "create the batch, round, and transition atomically and cannot be "
-            "triggered on its own yet."
-        )
+        if self._adapter is None:
+            raise NotImplementedError(
+                "generate_initial_design requires an optimizer adapter."
+            )
+        with self._repo.transaction():
+            run = self._require_run(run_id)
+            revision = self._repo.get_revision(run.definition_revision_id)
+            if revision is None:
+                raise ServiceError(
+                    f"Run {run_id!r} pins unknown revision "
+                    f"{run.definition_revision_id!r}."
+                )
+            definition_result = validate_definition(revision)
+            if not definition_result.ok:
+                raise ServiceError(
+                    "Cannot generate an initial design for an invalid design "
+                    f"space: {self._codes(definition_result)}."
+                )
+            policy = run.optimization_policy
+            result = self._adapter.generate_initial_design(revision, policy)
+            candidates = list(result.candidates)
+            if len(candidates) != policy.batch_size:
+                raise ServiceError(
+                    f"Adapter returned {len(candidates)} candidates, but the "
+                    f"policy batchSize is {policy.batch_size}."
+                )
+            candidate_result = validate_candidates(revision, candidates)
+            if not candidate_result.ok:
+                raise ServiceError(
+                    "Adapter returned invalid candidates: "
+                    f"{self._codes(candidate_result)}."
+                )
+            round_number = run.round + 1
+            now = _now()
+            batch = RecommendationBatch(
+                id=str(uuid.uuid4()),
+                campaign_run_id=run_id,
+                round_number=round_number,
+                generated_at=now,
+                input_snapshot=result.input_snapshot,
+                algorithm_config=result.algorithm_config,
+                candidates=candidates,
+                status=BatchStatus.PROPOSED,
+            )
+            self._repo.add_batch(batch)
+            experiment_round = ExperimentRound(
+                id=str(uuid.uuid4()),
+                campaign_run_id=run_id,
+                round_number=round_number,
+                recommendation_batch_id=batch.id,
+                opened_at=now,
+                status=RoundStatus.OPEN,
+            )
+            self._repo.add_round(experiment_round)
+            for candidate in candidates:
+                self._repo.add_experiment_run(
+                    ExperimentRun(
+                        id=str(uuid.uuid4()),
+                        campaign_run_id=run_id,
+                        experiment_round_id=experiment_round.id,
+                        recommendation_candidate_id=candidate.id,
+                        parameter_values=dict(candidate.parameter_values),
+                        status=ExperimentRunStatus.PENDING,
+                    )
+                )
+            self._transition(
+                run,
+                RunEvent.GENERATE_INITIAL_DESIGN,
+                actor,
+                DecisionAction.INITIAL_DESIGN_GENERATED,
+                extra_update={"round": round_number},
+            )
+            return batch
 
     def recommend(self, run_id: str, actor: str) -> None:
-        """Not available until the optimizer adapter exists (§4.1).
+        """Not available until a recommend-capable adapter exists (§4.1).
 
-        Recommendation must persist a batch, open a round, and transition the run
-        in one transaction. That cannot be assembled without the adapter, so this
-        operation is intentionally unavailable rather than letting a caller jump
-        the run's state on its own.
+        Later-round recommendation must feed the run's history to the adapter and
+        persist the batch, round, and transition atomically. That is out of scope
+        for the single-round loop, so this operation is intentionally unavailable.
 
         Raises:
             NotImplementedError: Always.
         """
         raise NotImplementedError(
-            "recommend requires the optimizer adapter; it must create the "
-            "batch, round, and transition atomically and cannot be triggered on "
-            "its own yet."
+            "recommend requires a recommend-capable optimizer adapter; it must "
+            "create the batch, round, and transition atomically and is out of "
+            "scope for the single-round loop."
         )
+
+    def record_experiment_result(
+        self,
+        run_id: str,
+        experiment_run_id: str,
+        actor: str,
+        status: ExperimentRunStatus,
+        executed_at: datetime | None = None,
+        notes: str | None = None,
+    ) -> ExperimentRun:
+        """Record the physical outcome of one experiment (§2.11).
+
+        Only the execution status and its metadata may change; the candidate and
+        parameter values are fixed at creation and must still match the batch.
+        Recording a terminal result re-syncs the run's ``budgetUsed`` and the
+        batch's execution status.
+
+        Args:
+            run_id: The run that owns the experiment.
+            experiment_run_id: The experiment to update.
+            actor: The executor identity, recorded on the run and in the log.
+            status: The terminal execution status (``Completed`` or ``Failed``).
+            executed_at: The execution timestamp; defaults to now.
+            notes: Optional free-text notes.
+
+        Returns:
+            The saved experiment run.
+
+        Raises:
+            ServiceError: If the experiment is unknown, not owned by the run, not
+                given a terminal status, or its candidate/values disagree with the
+                batch.
+        """
+        if status not in _BUDGET_CONSUMING:
+            raise ServiceError(
+                "record_experiment_result only records terminal results "
+                "(Completed/Failed); use abort_round to cancel."
+            )
+        with self._repo.transaction():
+            run = self._require_run(run_id)
+            experiment = self._repo.get_experiment_run(experiment_run_id)
+            if experiment is None:
+                raise ServiceError(
+                    f"Unknown experiment run {experiment_run_id!r}."
+                )
+            if experiment.campaign_run_id != run_id:
+                raise ServiceError(
+                    f"Experiment run {experiment_run_id!r} does not belong to run "
+                    f"{run_id!r}."
+                )
+            self._assert_candidate_consistent(experiment)
+            updated = experiment.model_copy(
+                update={
+                    "status": status,
+                    "executed_at": executed_at or _now(),
+                    "executed_by": actor,
+                    "notes": notes if notes is not None else experiment.notes,
+                }
+            )
+            self._repo.save_experiment_run(updated)
+            self._sync_batch_status(experiment.experiment_round_id)
+            self._sync_budget_used(run)
+            self._repo.append_decision_log(
+                DecisionLog(
+                    id=str(uuid.uuid4()),
+                    campaign_run_id=run_id,
+                    timestamp=_now(),
+                    actor=actor,
+                    action=DecisionAction.EXPERIMENT_RUN_EXECUTED,
+                    definition_revision_id=run.definition_revision_id,
+                    related_entity_id=experiment_run_id,
+                )
+            )
+            return updated
+
+    def record_measurement(
+        self, measurement: Measurement, actor: str
+    ) -> Measurement:
+        """Append a measurement to its supersede chain and log it (§2.12).
+
+        The repository validates that the output belongs to the run's pinned
+        revision and that the reading extends the ``(experimentRunId, outputId)``
+        chain contiguously; the service adds the audit entry.
+
+        Args:
+            measurement: The reading to append.
+            actor: The recorder identity for the decision log.
+
+        Returns:
+            The appended measurement.
+
+        Raises:
+            ServiceError: If the experiment run or its campaign run is unknown.
+            PersistenceError: If the output or supersede chain is invalid.
+        """
+        with self._repo.transaction():
+            experiment = self._repo.get_experiment_run(measurement.experiment_run_id)
+            if experiment is None:
+                raise ServiceError(
+                    "Measurement references unknown experiment run "
+                    f"{measurement.experiment_run_id!r}."
+                )
+            run = self._repo.get_run(experiment.campaign_run_id)
+            if run is None:
+                raise ServiceError(
+                    "Cannot resolve the campaign run for experiment run "
+                    f"{experiment.id!r}."
+                )
+            self._repo.add_measurement(measurement)
+            action = (
+                DecisionAction.MEASUREMENT_RECORDED
+                if measurement.revision == 1
+                else DecisionAction.MEASUREMENT_SUPERSEDED
+            )
+            self._repo.append_decision_log(
+                DecisionLog(
+                    id=str(uuid.uuid4()),
+                    campaign_run_id=run.id,
+                    timestamp=_now(),
+                    actor=actor,
+                    action=action,
+                    definition_revision_id=run.definition_revision_id,
+                    related_entity_id=measurement.id,
+                )
+            )
+            return measurement
 
     def mark_all_runs_terminal(self, run_id: str, actor: str) -> CampaignRun:
         """Move a pending round to awaiting-measurements once execution ends (§3.2).
 
-        The run may only leave ``RecommendationsPending`` when its open round has
-        no experiment still ``Pending``; otherwise the physical work is not
-        actually finished.
+        The run may only leave ``RecommendationsPending`` when its open round's
+        experiments correspond one-to-one with the batch's candidates and every
+        one of them is physically finished (Completed/Failed/Cancelled).
 
         Args:
             run_id: The run to advance.
@@ -282,8 +510,8 @@ class ApplicationService:
             The saved run in the ``AwaitingMeasurements`` state.
 
         Raises:
-            ServiceError: If there is no open round, or an experiment is still
-                pending.
+            ServiceError: If there is no open round, the experiments do not match
+                the batch candidates, or one is still pending.
             StateTransitionError: If the transition is not permitted.
         """
         with self._repo.transaction():
@@ -293,20 +521,47 @@ class ApplicationService:
                 raise ServiceError(
                     f"Run {run_id!r} has no open round to conclude."
                 )
-            pending = [
-                experiment
-                for experiment in self._repo.list_experiment_runs(open_round.id)
-                if experiment.status is ExperimentRunStatus.PENDING
-            ]
-            if pending:
+            batch = self._repo.get_batch(open_round.recommendation_batch_id)
+            if batch is None:
                 raise ServiceError(
-                    "Cannot mark all runs terminal while experiments are still "
-                    f"pending: {[experiment.id for experiment in pending]}."
+                    "Cannot resolve the recommendation batch for round "
+                    f"{open_round.id!r}."
+                )
+            experiments = self._repo.list_experiment_runs(open_round.id)
+            if not experiments:
+                raise ServiceError(
+                    f"Round {open_round.id!r} has no experiments to conclude."
+                )
+            candidate_ids = {candidate.id for candidate in batch.candidates}
+            experiment_candidate_ids = {
+                experiment.recommendation_candidate_id for experiment in experiments
+            }
+            if experiment_candidate_ids != candidate_ids or len(experiments) != len(
+                batch.candidates
+            ):
+                raise ServiceError(
+                    "The round's experiments must correspond one-to-one with the "
+                    "batch's candidates before it can be concluded."
+                )
+            not_terminal = [
+                experiment.id
+                for experiment in experiments
+                if experiment.status not in _TERMINAL_EXPERIMENT
+            ]
+            if not_terminal:
+                raise ServiceError(
+                    "Cannot mark all runs terminal while experiments are not "
+                    f"finished: {not_terminal}."
                 )
             return self._transition(run, RunEvent.ALL_RUNS_TERMINAL, actor, None)
 
     def close_round(self, run_id: str, round_id: str, actor: str) -> CampaignRun:
-        """Close a run's open round and advance the run in one transaction (§3.2).
+        """Close a run's open round once its results are ready (§3.2, §4).
+
+        Readiness is judged by :func:`assess_readiness` over the round's
+        measurements — the objective's outputs must all have a valid reading —
+        never asserted by the caller. A round that is not ready cannot be closed
+        (use :meth:`abort_round` to abandon it instead).
 
         Args:
             run_id: The run that owns the round.
@@ -317,8 +572,8 @@ class ApplicationService:
             The saved run in the ``RoundClosed`` state.
 
         Raises:
-            ServiceError: If the round does not exist, belongs to another run, or
-                is not open.
+            ServiceError: If the round does not exist, belongs to another run, is
+                not open, or is not ready to close.
             StateTransitionError: If the run cannot close a round now.
         """
         with self._repo.transaction():
@@ -326,6 +581,21 @@ class ApplicationService:
             experiment_round = self._require_round(round_id, run_id)
             if experiment_round.status is not RoundStatus.OPEN:
                 raise ServiceError(f"Round {round_id!r} is already closed.")
+            revision = self._repo.get_revision(run.definition_revision_id)
+            if revision is None:
+                raise ServiceError(
+                    f"Run {run_id!r} pins unknown revision "
+                    f"{run.definition_revision_id!r}."
+                )
+            measurements: list[Measurement] = []
+            for experiment in self._repo.list_experiment_runs(round_id):
+                measurements.extend(self._repo.list_measurements(experiment.id))
+            readiness = assess_readiness(revision, measurements)
+            if not readiness.ok:
+                raise ServiceError(
+                    f"Round {round_id!r} is not ready to close: "
+                    f"{self._codes(readiness)}."
+                )
             updated = self._transition(
                 run, RunEvent.CLOSE_ROUND, actor, DecisionAction.ROUND_CLOSED
             )
@@ -450,6 +720,10 @@ class ApplicationService:
     ) -> CampaignRun:
         """Replace a run's optimization policy before its first batch (§3.6).
 
+        The policy is editable only while the run is still ``Draft`` or
+        ``DesignSpaceValidated`` and no batch has been generated; an archived or
+        in-flight run is frozen.
+
         Args:
             run_id: The run to update.
             policy: The replacement policy.
@@ -458,10 +732,12 @@ class ApplicationService:
             The saved run.
 
         Raises:
-            ServiceError: If the run does not exist, or a batch already exists.
+            ServiceError: If the run does not exist, is not in an editable state,
+                or a batch already exists.
         """
         with self._repo.transaction():
             run = self._require_run(run_id)
+            self._require_editable(run)
             self._reject_if_batched(run_id, "optimizationPolicy")
             updated = run.model_copy(
                 update={"optimization_policy": policy, "updated_at": _now()}
@@ -469,25 +745,31 @@ class ApplicationService:
             self._repo.save_run(updated)
             return updated
 
-    def repin_revision(self, run_id: str, revision_id: str) -> CampaignRun:
+    def repin_revision(
+        self, run_id: str, revision_id: str, actor: str
+    ) -> CampaignRun:
         """Repin a run's definition revision before its first batch (§3.6).
 
-        The target revision must exist and belong to the run's campaign, and the
-        run must not yet have produced a batch.
+        The run must still be editable (``Draft``/``DesignSpaceValidated``) with
+        no batch yet, and the target revision must exist and belong to the run's
+        campaign. Repinning to a *different* revision invalidates any prior
+        validation, so a ``DesignSpaceValidated`` run drops back to ``Draft``.
 
         Args:
             run_id: The run to update.
             revision_id: The revision id to pin.
+            actor: The identity recorded in the decision log.
 
         Returns:
             The saved run.
 
         Raises:
-            ServiceError: If the run does not exist, a batch already exists, or
-                the target revision is unknown or belongs to another campaign.
+            ServiceError: If the run does not exist, is not editable, a batch
+                already exists, or the target revision is unknown or foreign.
         """
         with self._repo.transaction():
             run = self._require_run(run_id)
+            self._require_editable(run)
             self._reject_if_batched(run_id, "definitionRevisionId")
             revision = self._repo.get_revision(revision_id)
             if revision is None:
@@ -497,17 +779,33 @@ class ApplicationService:
                     "The target revision must belong to the run's campaign "
                     "definition."
                 )
-            updated = run.model_copy(
-                update={"definition_revision_id": revision_id, "updated_at": _now()}
-            )
+            changed = revision_id != run.definition_revision_id
+            update: dict[str, Any] = {
+                "definition_revision_id": revision_id,
+                "updated_at": _now(),
+            }
+            if changed and run.status is RunStatus.DESIGN_SPACE_VALIDATED:
+                update["status"] = RunStatus.DRAFT
+            updated = run.model_copy(update=update)
             self._repo.save_run(updated)
+            self._repo.append_decision_log(
+                DecisionLog(
+                    id=str(uuid.uuid4()),
+                    campaign_run_id=run_id,
+                    timestamp=_now(),
+                    actor=actor,
+                    action=DecisionAction.REVISION_REPINNED,
+                    definition_revision_id=revision_id,
+                )
+            )
             return updated
 
     def recompute_counters(self, run_id: str) -> CampaignRun:
         """Derive ``round`` and ``budgetUsed`` from persisted entities (§3.5).
 
-        ``round`` is the number of closed experiment rounds; ``budgetUsed`` is the
-        number of experiment runs in a budget-consuming (Completed/Failed) status.
+        ``round`` is the number of persisted recommendation batches; ``budgetUsed``
+        is the number of experiment runs in a budget-consuming (Completed/Failed)
+        status.
 
         Args:
             run_id: The run whose counters to recompute.
@@ -520,15 +818,14 @@ class ApplicationService:
         """
         with self._repo.transaction():
             run = self._require_run(run_id)
-            rounds = self._repo.list_rounds(run_id)
-            closed = sum(1 for r in rounds if r.status is RoundStatus.CLOSED)
+            batches = self._repo.list_batches(run_id)
             experiments = self._repo.list_experiment_runs_for_run(run_id)
             consumed = sum(
                 1 for e in experiments if e.status in _BUDGET_CONSUMING
             )
             updated = run.model_copy(
                 update={
-                    "round": closed,
+                    "round": len(batches),
                     "budget_used": consumed,
                     "updated_at": _now(),
                 }
@@ -572,12 +869,84 @@ class ApplicationService:
             )
         return updated
 
+    def _assert_candidate_consistent(self, experiment: ExperimentRun) -> None:
+        """Assert an experiment's candidate/values still match its batch (§2.11)."""
+        experiment_round = self._repo.get_round(experiment.experiment_round_id)
+        if experiment_round is None:
+            raise ServiceError(
+                "Cannot resolve the round for experiment run "
+                f"{experiment.id!r}."
+            )
+        batch = self._repo.get_batch(experiment_round.recommendation_batch_id)
+        if batch is None:
+            raise ServiceError(
+                "Cannot resolve the recommendation batch for round "
+                f"{experiment_round.id!r}."
+            )
+        candidate = next(
+            (
+                candidate
+                for candidate in batch.candidates
+                if candidate.id == experiment.recommendation_candidate_id
+            ),
+            None,
+        )
+        if candidate is None:
+            raise ServiceError(
+                f"Experiment run {experiment.id!r} references candidate "
+                f"{experiment.recommendation_candidate_id!r}, which is not in its "
+                "batch."
+            )
+        if dict(candidate.parameter_values) != dict(experiment.parameter_values):
+            raise ServiceError(
+                f"Experiment run {experiment.id!r} parameter values disagree with "
+                f"its recommendation candidate {candidate.id!r}."
+            )
+
+    def _sync_batch_status(self, round_id: str) -> None:
+        """Reconcile a batch's status with how many experiments have executed."""
+        experiment_round = self._repo.get_round(round_id)
+        if experiment_round is None:
+            return
+        batch = self._repo.get_batch(experiment_round.recommendation_batch_id)
+        if batch is None or batch.status is BatchStatus.SUPERSEDED:
+            return
+        experiments = self._repo.list_experiment_runs(round_id)
+        executed = sum(1 for e in experiments if e.status in _BUDGET_CONSUMING)
+        if executed == 0:
+            status = BatchStatus.PROPOSED
+        elif executed >= len(batch.candidates):
+            status = BatchStatus.FULLY_EXECUTED
+        else:
+            status = BatchStatus.PARTIALLY_EXECUTED
+        if status is not batch.status:
+            self._repo.save_batch(batch.model_copy(update={"status": status}))
+
+    def _sync_budget_used(self, run: CampaignRun) -> None:
+        """Reconcile a run's ``budgetUsed`` with its terminal experiment count."""
+        experiments = self._repo.list_experiment_runs_for_run(run.id)
+        consumed = sum(1 for e in experiments if e.status in _BUDGET_CONSUMING)
+        if consumed != run.budget_used:
+            self._repo.save_run(
+                run.model_copy(
+                    update={"budget_used": consumed, "updated_at": _now()}
+                )
+            )
+
     def _require_run(self, run_id: str) -> CampaignRun:
         """Fetch a run or raise a :class:`ServiceError`."""
         run = self._repo.get_run(run_id)
         if run is None:
             raise ServiceError(f"Unknown run {run_id!r}.")
         return run
+
+    def _require_editable(self, run: CampaignRun) -> None:
+        """Reject an edit to a run that is past the editable states (§3.6)."""
+        if run.status not in _EDITABLE_STATUSES:
+            raise ServiceError(
+                f"Run {run.id!r} is not editable in state {run.status.value!r}; "
+                "only Draft or DesignSpaceValidated runs may be edited."
+            )
 
     def _require_round(self, round_id: str, run_id: str) -> ExperimentRound:
         """Fetch a round and assert it belongs to ``run_id``."""
@@ -607,6 +976,11 @@ class ApplicationService:
             raise ServiceError(
                 f"{field} is frozen after the first recommendation batch."
             )
+
+    @staticmethod
+    def _codes(result: ValidationResult) -> list[str]:
+        """Return the blocking issue codes of a validation result."""
+        return [issue.code for issue in result.blocking_issues]
 
 
 __all__ = ["ApplicationService", "ServiceError", "PersistenceError"]

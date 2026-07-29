@@ -14,8 +14,65 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend.application import ApplicationService  # noqa: E402
+from backend.application.adapter import (  # noqa: E402
+    OptimizerAdapter,
+    RecommendationResult,
+)
 from backend.domain import models as m  # noqa: E402  (after sys.path setup)
 from backend.persistence import SqliteRepository  # noqa: E402
+
+
+class FakeOptimizerAdapter:
+    """A test-only :class:`OptimizerAdapter` returning fixed legal candidates.
+
+    Produces exactly ``policy.batch_size`` distinct candidates whose parameter
+    values lie inside the two continuous parameters' ``[0, 100]`` bounds, plus a
+    fixed, reproducible :class:`~backend.domain.models.AlgorithmConfig`. The
+    candidate ids (``cand-1`` .. ``cand-N``) and the resin/hard geometry mirror
+    the ``_batch`` fixture so a produced batch is indistinguishable from a
+    hand-seeded one.
+    """
+
+    def __init__(self, backend_name: str = "fake") -> None:
+        self._backend_name = backend_name
+        self.calls: list[tuple[str, str]] = []
+
+    def generate_initial_design(
+        self,
+        revision: m.CampaignDefinitionRevision,
+        policy: m.OptimizationPolicy,
+    ) -> RecommendationResult:
+        self.calls.append((revision.id, policy.id))
+        candidates = [
+            m.RecommendationCandidate(
+                id=f"cand-{i}",
+                parameter_values={"resin": float(i * 10), "hard": float(i * 5)},
+            )
+            for i in range(1, policy.batch_size + 1)
+        ]
+        config = m.AlgorithmConfig(
+            backend_name=self._backend_name,
+            backend_version="0.0.0",
+            backend_commit="cafef00d",
+            strategy_kind="Botorch",
+            acquisition_function="qLogEI",
+            seed=policy.seed_value,
+            environment=m.Environment(
+                python_version="3.11.15",
+                torch_version="2.4.0",
+                botorch_version="0.11.0",
+                dependency_lock_hash="sha256:0",
+            ),
+        )
+        return RecommendationResult(
+            candidates=candidates,
+            algorithm_config=config,
+            input_snapshot={"revisionId": revision.id, "policyId": policy.id},
+        )
+
+
+# Fail loudly if the fake ever drifts out of protocol conformance.
+assert isinstance(FakeOptimizerAdapter(), OptimizerAdapter)
 
 
 def _revision(**overrides) -> m.CampaignDefinitionRevision:
@@ -110,7 +167,6 @@ def _round(**overrides) -> m.ExperimentRound:
         campaign_run_id="run-1",
         round_number=1,
         recommendation_batch_id="batch-1",
-        experiment_run_ids=[],
         opened_at="2026-07-29T00:00:00Z",
         status=m.RoundStatus.OPEN,
     )
@@ -219,6 +275,18 @@ def repo():
 def service(repo):
     """Return an application service over a fresh repository."""
     return ApplicationService(repo)
+
+
+@pytest.fixture
+def fake_adapter():
+    """Return a fresh :class:`FakeOptimizerAdapter`."""
+    return FakeOptimizerAdapter()
+
+
+@pytest.fixture
+def service_with_adapter(repo, fake_adapter):
+    """Return an application service wired to a :class:`FakeOptimizerAdapter`."""
+    return ApplicationService(repo, adapter=fake_adapter)
 
 
 @pytest.fixture

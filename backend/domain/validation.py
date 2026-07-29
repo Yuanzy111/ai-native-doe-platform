@@ -653,6 +653,59 @@ def active_measurements(measurements: list[Measurement]) -> list[Measurement]:
     ]
 
 
+def _objective_output_ids(revision: CampaignDefinitionRevision) -> set[str]:
+    """Return the output ids the run's objective must observe to be assessable."""
+    output_by_target = {t.id: t.output_id for t in revision.targets}
+    policy = revision.objective_policy
+    if isinstance(policy, SingleObjectivePolicy):
+        target_ids = [policy.target_id]
+    elif isinstance(policy, DesirabilityObjectivePolicy):
+        target_ids = [entry.target_id for entry in policy.entries]
+    elif isinstance(policy, ParetoObjectivePolicy):
+        target_ids = list(policy.target_ids)
+    else:
+        target_ids = []
+    return {
+        output_by_target[target_id]
+        for target_id in target_ids
+        if target_id in output_by_target
+    }
+
+
+def assess_readiness(
+    revision: CampaignDefinitionRevision, measurements: list[Measurement]
+) -> ValidationResult:
+    """Judge whether a round has enough valid readings to close (§4).
+
+    Closing a round requires an active (valid, non-superseded) measurement for
+    every output the objective depends on: the single target's output for a
+    ``Single`` objective, and each covered target's output for ``Desirability``
+    and ``Pareto``. This is computed by the service, never asserted by the
+    caller, so a round cannot be closed before its results actually exist.
+
+    Args:
+        revision: The run's pinned definition revision.
+        measurements: The measurements recorded for the round's experiments.
+
+    Returns:
+        A :class:`ValidationResult`; a missing active reading for any required
+        output is blocking, so ``ok`` is the readiness verdict.
+    """
+    required = _objective_output_ids(revision)
+    observed = {m.output_id for m in active_measurements(measurements)}
+    issues = [
+        ValidationIssue(
+            code="OUTPUT_NOT_MEASURED",
+            message=f"Output {output_id!r} has no valid reading; the round is "
+            "not ready to close.",
+            severity=Severity.BLOCKING,
+            related_entity_id=output_id,
+        )
+        for output_id in sorted(required - observed)
+    ]
+    return ValidationResult(issues=tuple(issues))
+
+
 def validate_supersede_chains(measurements: list[Measurement]) -> ValidationResult:
     """Check the integrity of every ``(experimentRunId, outputId)`` chain (§2.12).
 
@@ -846,6 +899,7 @@ __all__ = [
     "ValidationIssue",
     "ValidationResult",
     "active_measurements",
+    "assess_readiness",
     "can_transition",
     "next_status",
     "validate_candidates",

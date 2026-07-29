@@ -158,12 +158,12 @@ class TestRepinRevision:
 
     def test_repin_to_valid_revision(self, service, seeded_run, make_revision):
         self._add_second_revision(service, make_revision)
-        run = service.repin_revision("run-1", "rev-2")
+        run = service.repin_revision("run-1", "rev-2", "user-1")
         assert run.definition_revision_id == "rev-2"
 
     def test_repin_unknown_revision_rejected(self, service, seeded_run):
         with pytest.raises(ServiceError):
-            service.repin_revision("run-1", "ghost")
+            service.repin_revision("run-1", "ghost", "user-1")
 
     def test_repin_foreign_revision_rejected(
         self, service, seeded_run, repo, make_definition, make_revision
@@ -174,12 +174,12 @@ class TestRepinRevision:
             )
             repo.add_revision(make_revision(id="rev-x", campaign_definition_id="cd-2"))
         with pytest.raises(ServiceError):
-            service.repin_revision("run-1", "rev-x")
+            service.repin_revision("run-1", "rev-x", "user-1")
 
     def test_repin_frozen_after_batch(self, service, seeded_run, make_batch):
         seeded_run.add_batch(make_batch())
         with pytest.raises(ServiceError):
-            service.repin_revision("run-1", "rev-2")
+            service.repin_revision("run-1", "rev-2", "user-1")
 
 
 class TestFreezeAfterFirstBatch:
@@ -235,12 +235,18 @@ class TestCloseRound:
     """Closing a round advances the run and syncs the round in one transaction."""
 
     def test_close_round_syncs_round_status(
-        self, service, repo, make_definition, make_revision, make_run, make_batch, make_round
+        self, service, repo, make_definition, make_revision, make_run, make_batch,
+        make_round, make_experiment_run, make_measurement
     ):
         _seed_run_with_round(
             repo, make_definition, make_revision, make_run, make_batch, make_round,
             status=m.RunStatus.AWAITING_MEASUREMENTS,
         )
+        with repo.transaction():
+            repo.add_experiment_run(
+                make_experiment_run(id="exp-1", recommendation_candidate_id="cand-1")
+            )
+            repo.add_measurement(make_measurement(experiment_run_id="exp-1"))
         run = service.close_round("run-1", "round-1", "user-1")
         assert run.status is m.RunStatus.ROUND_CLOSED
         closed = repo.get_round("round-1")
@@ -281,12 +287,18 @@ class TestCloseRound:
             service.close_round("run-1", "round-2", "user-1")
 
     def test_close_illegal_from_draft_raises(
-        self, service, repo, make_definition, make_revision, make_run, make_batch, make_round
+        self, service, repo, make_definition, make_revision, make_run, make_batch,
+        make_round, make_experiment_run, make_measurement
     ):
         _seed_run_with_round(
             repo, make_definition, make_revision, make_run, make_batch, make_round,
             status=m.RunStatus.DRAFT,
         )
+        with repo.transaction():
+            repo.add_experiment_run(
+                make_experiment_run(id="exp-1", recommendation_candidate_id="cand-1")
+            )
+            repo.add_measurement(make_measurement(experiment_run_id="exp-1"))
         with pytest.raises(StateTransitionError):
             service.close_round("run-1", "round-1", "user-1")
 
@@ -341,6 +353,7 @@ class TestMarkAllRunsTerminal:
             repo.add_experiment_run(
                 make_experiment_run(
                     id="exp-1",
+                    recommendation_candidate_id="cand-1",
                     status=m.ExperimentRunStatus.PENDING,
                     executed_at=None,
                     executed_by=None,
@@ -357,7 +370,9 @@ class TestMarkAllRunsTerminal:
             status=m.RunStatus.RECOMMENDATIONS_PENDING,
         )
         with repo.transaction():
-            repo.add_experiment_run(make_experiment_run(id="exp-1"))
+            repo.add_experiment_run(
+                make_experiment_run(id="exp-1", recommendation_candidate_id="cand-1")
+            )
         run = service.mark_all_runs_terminal("run-1", "user-1")
         assert run.status is m.RunStatus.AWAITING_MEASUREMENTS
 

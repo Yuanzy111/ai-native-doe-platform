@@ -233,6 +233,27 @@ class SqliteRepository:
                     f"{row[column]!r} to {value!r}."
                 )
 
+    def _guard_fields_unchanged(
+        self, existing: object, incoming: object, fields: list[str]
+    ) -> None:
+        """Reject a save that would change any of ``fields`` on a JSON-blob model.
+
+        The extracted foreign-key columns are protected by
+        :meth:`_guard_immutable`, but a document row also carries fields that
+        live only inside the JSON blob (candidates, parameter values, ...). Those
+        must stay fixed once created; only a model's genuinely mutable state may
+        be rewritten. This compares the persisted model with the incoming one and
+        raises on the first divergence.
+        """
+        for field_name in fields:
+            old = getattr(existing, field_name)
+            new = getattr(incoming, field_name)
+            if old != new:
+                raise PersistenceError(
+                    f"{type(incoming).__name__}.{field_name} is immutable and "
+                    f"cannot be changed from {old!r} to {new!r}."
+                )
+
     def _fetch_one(self, table: str, entity_id: str) -> sqlite3.Row | None:
         """Fetch one row by id, or ``None``."""
         return self._conn.execute(
@@ -369,13 +390,27 @@ class SqliteRepository:
         """Persist an updated run (status/revision/counter changes).
 
         ``campaignDefinitionId`` is the run's parent and is immutable; only the
-        pinned revision, status, and JSON state may change.
+        pinned revision, status, and JSON state may change. Every save re-checks
+        that the pinned revision exists and belongs to the run's campaign, so a
+        repin can never leave the extracted column pointing at a foreign or
+        dangling revision.
         """
         self._guard_immutable(
             "campaign_run",
             run.id,
             {"campaign_definition_id": run.campaign_definition_id},
         )
+        revision = self.get_revision(run.definition_revision_id)
+        if revision is None:
+            raise PersistenceError(
+                f"Run references unknown revision {run.definition_revision_id!r}."
+            )
+        if revision.campaign_definition_id != run.campaign_definition_id:
+            raise PersistenceError(
+                "The run's pinned revision must belong to the run's campaign "
+                f"definition {run.campaign_definition_id!r}, but revision "
+                f"{revision.id!r} belongs to {revision.campaign_definition_id!r}."
+            )
         self._update(
             "campaign_run",
             run.id,
@@ -445,7 +480,7 @@ class SqliteRepository:
         """Persist an updated experiment round (e.g. on close).
 
         The run, round number, and originating batch are immutable; only the
-        JSON state (status/closedAt/experimentRunIds) may change.
+        JSON state (status/closedAt) may change.
         """
         self._guard_immutable(
             "experiment_round",
@@ -514,7 +549,9 @@ class SqliteRepository:
     def save_experiment_run(self, experiment_run: ExperimentRun) -> None:
         """Persist an updated experiment run (status/result changes).
 
-        The owning run and round are immutable; only the JSON state may change.
+        The identity, owning run and round, originating candidate, and the
+        assigned parameter values are all fixed at creation; only the execution
+        status and its metadata (executedAt/executedBy/notes) may change.
         """
         self._guard_immutable(
             "experiment_run",
@@ -523,6 +560,16 @@ class SqliteRepository:
                 "campaign_run_id": experiment_run.campaign_run_id,
                 "experiment_round_id": experiment_run.experiment_round_id,
             },
+        )
+        existing = self.get_experiment_run(experiment_run.id)
+        if existing is None:
+            raise PersistenceError(
+                f"No 'experiment_run' row with id {experiment_run.id!r} to update."
+            )
+        self._guard_fields_unchanged(
+            existing,
+            experiment_run,
+            ["recommendation_candidate_id", "parameter_values"],
         )
         self._update(
             "experiment_run",
@@ -681,10 +728,12 @@ class SqliteRepository:
         )
 
     def save_batch(self, batch: RecommendationBatch) -> None:
-        """Persist an updated batch (status changes).
+        """Persist an updated batch (status changes only).
 
-        The owning run and round number are immutable; only the JSON state
-        (e.g. status) may change.
+        A batch records the exact inputs, algorithm configuration, and candidates
+        produced for a round; once created, every field except ``status`` is
+        immutable, so a save can only advance the execution status and never
+        rewrite what was recommended.
         """
         self._guard_immutable(
             "recommendation_batch",
@@ -693,6 +742,21 @@ class SqliteRepository:
                 "campaign_run_id": batch.campaign_run_id,
                 "round_number": batch.round_number,
             },
+        )
+        existing = self.get_batch(batch.id)
+        if existing is None:
+            raise PersistenceError(
+                f"No 'recommendation_batch' row with id {batch.id!r} to update."
+            )
+        self._guard_fields_unchanged(
+            existing,
+            batch,
+            [
+                "generated_at",
+                "input_snapshot",
+                "algorithm_config",
+                "candidates",
+            ],
         )
         self._update(
             "recommendation_batch",
