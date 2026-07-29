@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { canGenerateInitialDesign, displayStatus } from './runState'
+import { canGenerateInitialDesign, displayStatus, isLifecycleLocked } from './runState'
 
 describe('displayStatus', () => {
   it('shows Draft before any run exists', () => {
@@ -31,5 +31,25 @@ describe('canGenerateInitialDesign', () => {
   it('is disabled before validation', () => {
     expect(canGenerateInitialDesign('Draft', false)).toBe(false)
     expect(canGenerateInitialDesign(null, false)).toBe(false)
+  })
+
+  it('is disabled once a batch already exists', () => {
+    expect(canGenerateInitialDesign('DesignSpaceValidated', false, true)).toBe(false)
+  })
+})
+
+describe('isLifecycleLocked', () => {
+  it('is unlocked before an initial design exists', () => {
+    expect(isLifecycleLocked(null)).toBe(false)
+    expect(isLifecycleLocked('Draft')).toBe(false)
+    expect(isLifecycleLocked('DesignSpaceValidated')).toBe(false)
+  })
+
+  it('locks once the run has produced recommendations', () => {
+    expect(isLifecycleLocked('RecommendationsPending')).toBe(true)
+    expect(isLifecycleLocked('AwaitingMeasurements')).toBe(true)
+    expect(isLifecycleLocked('RoundClosed')).toBe(true)
+    expect(isLifecycleLocked('Completed')).toBe(true)
+    expect(isLifecycleLocked('Archived')).toBe(true)
   })
 })

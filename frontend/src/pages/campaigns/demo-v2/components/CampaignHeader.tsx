@@ -9,6 +9,7 @@ interface Props {
   canGenerate: boolean
   saving: boolean
   validating: boolean
+  generating: boolean
   locked: boolean
   onSave: () => void
   onValidate: () => void
@@ -42,13 +43,14 @@ export default function CampaignHeader({
   canGenerate,
   saving,
   validating,
+  generating,
   locked,
   onSave,
   onValidate,
   onGenerateDesign,
 }: Props) {
   const statusClass = statusStyles[status] ?? 'bg-slate-100 text-slate-600 border-slate-200'
-  const busy = saving || validating || locked
+  const busy = saving || validating || generating || locked
 
   return (
     <header className="flex h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-5">
@@ -106,7 +108,7 @@ export default function CampaignHeader({
               onClick={onGenerateDesign}
               className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
             >
-              Generate Initial Design
+              {generating ? 'Generating…' : 'Generate Initial Design'}
             </button>
           </span>
         </div>

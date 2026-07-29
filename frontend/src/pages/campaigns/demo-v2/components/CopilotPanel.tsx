@@ -7,6 +7,9 @@ interface Props {
   experimentSummary: string
   constraint: ConstraintState
   locked: boolean
+  // True once an initial design has been generated and the run's design space
+  // is frozen by its lifecycle (distinct from the unsupported-config lock).
+  frozen: boolean
   onChoose: (choice: ConstraintChoice) => void
 }
 
@@ -32,16 +35,19 @@ export default function CopilotPanel({
   experimentSummary,
   constraint,
   locked,
+  frozen,
   onChoose,
 }: Props) {
   const resolved = isConstraintResolved(constraint)
   const constraintText = getConstraintDisplayText(constraint)
   const missingInformation = locked || resolved ? [] : [copilot.constraintMissingInfo]
-  const suggestedNextStep = locked
-    ? 'This run is read-only. Its configuration cannot be edited in this stage.'
-    : resolved
-      ? copilot.suggestedNextStepResolved
-      : copilot.suggestedNextStepPending
+  const suggestedNextStep = frozen
+    ? '初始设计已生成,Design Space 已冻结。请在 Recommendations 页面查看首轮实验推荐。'
+    : locked
+      ? 'This run is read-only. Its configuration cannot be edited in this stage.'
+      : resolved
+        ? copilot.suggestedNextStepResolved
+        : copilot.suggestedNextStepPending
 
   return (
     <aside className="flex w-[360px] shrink-0 flex-col border-l border-slate-200 bg-white">
@@ -91,8 +97,9 @@ export default function CopilotPanel({
           {locked ? (
             <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2.5">
               <p className="text-sm text-slate-600">
-                This run uses a configuration this stage cannot edit. Constraint choices are
-                disabled to avoid overwriting the server’s configuration.
+                {frozen
+                  ? '初始设计已生成,Design Space 已冻结,配置不可再编辑。'
+                  : 'This run uses a configuration this stage cannot edit. Constraint choices are disabled to avoid overwriting the server’s configuration.'}
               </p>
             </div>
           ) : resolved ? (

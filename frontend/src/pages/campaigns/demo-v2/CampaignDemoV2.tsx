@@ -3,18 +3,26 @@ import CampaignHeader from './components/CampaignHeader'
 import StageNav from './components/StageNav'
 import MainWorkspace from './components/MainWorkspace'
 import CopilotPanel from './components/CopilotPanel'
+import RecommendationsView from './components/RecommendationsView'
 import ConstraintDialog from './components/ConstraintDialog'
 import ParameterDialog from './components/ParameterDialog'
 import ObjectiveDialog from './components/ObjectiveDialog'
 import ToastStack from './components/ToastStack'
 import { campaignData, initialObjectives, initialParameters, stages } from './mockData'
 import { useToasts } from './useToasts'
-import { canGenerateInitialDesign, displayStatus } from './runState'
+import { canGenerateInitialDesign, displayStatus, isLifecycleLocked } from './runState'
 import { newFixedSumConstraintId } from './constraintUtils'
-import type { ConstraintChoice, ConstraintState, Objective, Parameter } from './types'
+import {
+  ENABLED_STAGE_KEYS,
+  resolveInitialStage,
+  selectRecommendationsData,
+  type RecommendationsData,
+} from './recommendationsState'
+import type { ConstraintChoice, ConstraintState, Objective, Parameter, StageKey } from './types'
 import { ApiError } from '../../../api/client'
 import {
   createCampaignRun,
+  generateInitialDesign,
   getCampaignRun,
   saveDesignSpace,
   validateDesignSpace,
@@ -62,6 +70,17 @@ function writeRunIdToUrl(runId: string): void {
 function clearRunIdFromUrl(): void {
   const url = new URL(window.location.href)
   url.searchParams.delete('runId')
+  url.searchParams.delete('stage')
+  window.history.replaceState(null, '', url)
+}
+
+function readStageFromUrl(): string | null {
+  return new URLSearchParams(window.location.search).get('stage')
+}
+
+function writeStageToUrl(stage: StageKey): void {
+  const url = new URL(window.location.href)
+  url.searchParams.set('stage', stage)
   window.history.replaceState(null, '', url)
 }
 
@@ -89,9 +108,13 @@ export default function CampaignDemoV2() {
   const [unsupported, setUnsupported] = useState<UnsupportedReason[]>([])
   const [restoreError, setRestoreError] = useState<string | null>(null)
 
+  const [activeStage, setActiveStage] = useState<StageKey>('design-space')
+  const [recommendations, setRecommendations] = useState<RecommendationsData | null>(null)
+
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [validating, setValidating] = useState(false)
+  const [generating, setGenerating] = useState(false)
 
   const { toasts, pushToast, dismissToast } = useToasts()
 
@@ -111,6 +134,7 @@ export default function CampaignDemoV2() {
       batchSize: hydrated.batchSize,
     })
     setUnsupported(hydrated.unsupported)
+    setRecommendations(selectRecommendationsData(view))
     setDirty(false)
     setBlockingIssues([])
   }
@@ -123,7 +147,10 @@ export default function CampaignDemoV2() {
     setRestoreError(null)
     setLoading(true)
     getCampaignRun(id)
-      .then(applyView)
+      .then((view) => {
+        applyView(view)
+        setActiveStage(resolveInitialStage(view, readStageFromUrl()))
+      })
       .catch((err: unknown) => {
         const message =
           err instanceof ApiError
@@ -157,6 +184,14 @@ export default function CampaignDemoV2() {
     setBlockingIssues([])
     setDirty(false)
     setRestoreError(null)
+    setRecommendations(null)
+    setActiveStage('design-space')
+  }
+
+  const handleSelectStage = (key: StageKey) => {
+    if (!ENABLED_STAGE_KEYS.includes(key)) return
+    setActiveStage(key)
+    writeStageToUrl(key)
   }
 
   const markDirty = () => {
@@ -164,11 +199,16 @@ export default function CampaignDemoV2() {
     setBlockingIssues([])
   }
 
-  const locked = unsupported.length > 0
+  // Frozen once the run's lifecycle has advanced past validation (an initial
+  // design exists); derived from the authoritative server status so the gate
+  // matches the backend after a reload, not just a local flag.
+  const lifecycleLocked = isLifecycleLocked(serverStatus)
+  const locked = unsupported.length > 0 || lifecycleLocked
+  const hasBatch = recommendations !== null
 
   const experimentSummary = `${parameters.length} 个参数、${objectives.length} 个优化目标已配置完成,尚未生成首轮实验推荐。`
   const status = displayStatus(serverStatus, dirty)
-  const canGenerate = canGenerateInitialDesign(serverStatus, dirty) && !locked
+  const canGenerate = canGenerateInitialDesign(serverStatus, dirty, hasBatch) && !locked
 
   const handleChooseConstraint = (choice: ConstraintChoice) => {
     if (locked) return
@@ -368,9 +408,38 @@ export default function CampaignDemoV2() {
     }
   }
 
-  const handleGenerateDesign = () => {
-    if (!canGenerate || locked) return
-    pushToast('info', 'Initial design generation is not wired up in this stage.')
+  const handleGenerateDesign = async () => {
+    if (!canGenerate || locked || generating || runId === null) return
+    setGenerating(true)
+    try {
+      const response = await generateInitialDesign(runId)
+      setServerStatus(response.campaignRun.status)
+      setMeta((current) => ({
+        ...current,
+        round: response.campaignRun.round,
+        budgetUsed: response.campaignRun.budgetUsed,
+        budgetTotal: response.campaignRun.budgetTotal,
+        batchSize: response.campaignRun.optimizationPolicy.batchSize,
+      }))
+      setRecommendations({
+        batch: response.recommendationBatch,
+        round: response.experimentRound,
+        experimentRuns: response.experimentRuns,
+      })
+      setActiveStage('recommendations')
+      writeStageToUrl('recommendations')
+      pushToast('success', 'Initial design generated.')
+    } catch (err) {
+      // Stay on the Design Space with its state intact; only surface the error.
+      pushToast(
+        'warning',
+        err instanceof ApiError
+          ? `${err.code}: ${err.message}`
+          : 'Failed to generate the initial design.',
+      )
+    } finally {
+      setGenerating(false)
+    }
   }
 
   const workspaceData = { ...campaignData, title: meta.title, goal: meta.goal }
@@ -426,35 +495,48 @@ export default function CampaignDemoV2() {
         canGenerate={canGenerate}
         saving={saving}
         validating={validating}
+        generating={generating}
         locked={locked}
         onSave={handleSave}
         onValidate={() => void handleValidate()}
-        onGenerateDesign={handleGenerateDesign}
+        onGenerateDesign={() => void handleGenerateDesign()}
       />
       <div className="flex min-h-0 flex-1">
-        <StageNav stages={stages} activeKey="design-space" />
-        <MainWorkspace
-          data={workspaceData}
-          parameters={parameters}
-          objectives={objectives}
-          constraint={constraint}
-          blockingIssues={blockingIssues}
-          unsupported={unsupported}
-          locked={locked}
-          onAddParameter={handleAddParameter}
-          onEditParameter={handleEditParameter}
-          onDeleteParameter={handleDeleteParameter}
-          onAddObjective={handleAddObjective}
-          onEditObjective={handleEditObjective}
-          onDeleteObjective={handleDeleteObjective}
+        <StageNav
+          stages={stages}
+          activeKey={activeStage}
+          enabledKeys={ENABLED_STAGE_KEYS}
+          onSelect={handleSelectStage}
         />
-        <CopilotPanel
-          copilot={campaignData.copilot}
-          experimentSummary={experimentSummary}
-          constraint={constraint}
-          locked={locked}
-          onChoose={handleChooseConstraint}
-        />
+        {activeStage === 'recommendations' && recommendations !== null ? (
+          <RecommendationsView data={recommendations} parameters={parameters} />
+        ) : (
+          <>
+            <MainWorkspace
+              data={workspaceData}
+              parameters={parameters}
+              objectives={objectives}
+              constraint={constraint}
+              blockingIssues={blockingIssues}
+              unsupported={unsupported}
+              locked={locked}
+              onAddParameter={handleAddParameter}
+              onEditParameter={handleEditParameter}
+              onDeleteParameter={handleDeleteParameter}
+              onAddObjective={handleAddObjective}
+              onEditObjective={handleEditObjective}
+              onDeleteObjective={handleDeleteObjective}
+            />
+            <CopilotPanel
+              copilot={campaignData.copilot}
+              experimentSummary={experimentSummary}
+              constraint={constraint}
+              locked={locked}
+              frozen={lifecycleLocked}
+              onChoose={handleChooseConstraint}
+            />
+          </>
+        )}
       </div>
 
       <ParameterDialog

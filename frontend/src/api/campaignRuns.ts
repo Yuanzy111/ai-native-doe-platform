@@ -5,6 +5,7 @@ import { httpGet, httpPost, httpPut } from './client'
 import type {
   CreateCampaignRunBody,
   DesignSpaceBody,
+  InitialDesignResponseDto,
   RunViewDto,
   SaveDesignSpaceResponseDto,
   ValidateResponseDto,
@@ -31,5 +32,13 @@ export function saveDesignSpace(
 export function validateDesignSpace(runId: string): Promise<ValidateResponseDto> {
   return httpPost<ValidateResponseDto>(
     `/campaign-runs/${encodeURIComponent(runId)}/validate`,
+  )
+}
+
+// Generate the model-free first-round design. The backend runs the optimizer;
+// the frontend never touches BayBE directly.
+export function generateInitialDesign(runId: string): Promise<InitialDesignResponseDto> {
+  return httpPost<InitialDesignResponseDto>(
+    `/campaign-runs/${encodeURIComponent(runId)}/initial-design`,
   )
 }

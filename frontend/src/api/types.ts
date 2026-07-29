@@ -152,13 +152,92 @@ export interface CampaignRunDto {
   createdBy: string
 }
 
+// --- Recommendation batch / candidate ------------------------------------
+
+export type BatchStatus = 'Proposed' | 'PartiallyExecuted' | 'FullyExecuted' | 'Superseded'
+
+export interface EnvironmentDto {
+  pythonVersion: string
+  torchVersion: string
+  botorchVersion: string
+  dependencyLockHash: string
+}
+
+export interface AlgorithmConfigDto {
+  backendName: string
+  backendVersion: string
+  backendCommit: string
+  strategyKind: 'TwoPhaseMeta' | 'Botorch'
+  hyperparameters: Record<string, unknown>
+  acquisitionFunction: string
+  seed: number
+  environment: EnvironmentDto
+}
+
+export interface RecommendationCandidateDto {
+  id: string
+  parameterValues: Record<string, string | number>
+  // Null for a model-free initial design; never fabricate a value from null.
+  predictedMean: Record<string, number> | null
+  predictedSd: Record<string, number> | null
+  desirability: number | null
+}
+
+export interface RecommendationBatchDto {
+  id: string
+  campaignRunId: string
+  roundNumber: number
+  generatedAt: string
+  inputSnapshot: Record<string, unknown>
+  algorithmConfig: AlgorithmConfigDto
+  candidates: RecommendationCandidateDto[]
+  status: BatchStatus
+}
+
+// --- Experiment round / run ----------------------------------------------
+
+export type RoundStatus = 'Open' | 'Closed'
+export type ExperimentRunStatus = 'Pending' | 'Completed' | 'Failed' | 'Cancelled'
+
+export interface ExperimentRoundDto {
+  id: string
+  campaignRunId: string
+  roundNumber: number
+  recommendationBatchId: string
+  openedAt: string
+  closedAt: string | null
+  status: RoundStatus
+}
+
+export interface ExperimentRunDto {
+  id: string
+  campaignRunId: string
+  experimentRoundId: string
+  // Links back to the candidate this experiment realizes; null for manual runs.
+  recommendationCandidateId: string | null
+  parameterValues: Record<string, string | number>
+  status: ExperimentRunStatus
+  executedAt: string | null
+  executedBy: string | null
+  notes: string | null
+}
+
+export interface InitialDesignResponseDto {
+  campaignRun: CampaignRunDto
+  recommendationBatch: RecommendationBatchDto
+  experimentRound: ExperimentRoundDto | null
+  experimentRuns: ExperimentRunDto[]
+}
+
+// --- Aggregate / initial-design response ----------------------------------
+
 export interface RunViewDto {
   campaignDefinition: CampaignDefinitionDto
   pinnedRevision: RevisionDto
   campaignRun: CampaignRunDto
-  recommendationBatches: unknown[]
-  experimentRounds: unknown[]
-  experimentRuns: unknown[]
+  recommendationBatches: RecommendationBatchDto[]
+  experimentRounds: ExperimentRoundDto[]
+  experimentRuns: ExperimentRunDto[]
   measurements: unknown[]
   decisionLogs: unknown[]
 }
