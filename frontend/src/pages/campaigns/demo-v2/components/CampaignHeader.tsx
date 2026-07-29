@@ -9,6 +9,7 @@ interface Props {
   canGenerate: boolean
   saving: boolean
   validating: boolean
+  locked: boolean
   onSave: () => void
   onValidate: () => void
   onGenerateDesign: () => void
@@ -41,12 +42,13 @@ export default function CampaignHeader({
   canGenerate,
   saving,
   validating,
+  locked,
   onSave,
   onValidate,
   onGenerateDesign,
 }: Props) {
   const statusClass = statusStyles[status] ?? 'bg-slate-100 text-slate-600 border-slate-200'
-  const busy = saving || validating
+  const busy = saving || validating || locked
 
   return (
     <header className="flex h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-5">

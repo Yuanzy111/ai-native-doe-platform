@@ -52,6 +52,8 @@ export const initialParameters: Parameter[] = [
 export const initialObjectives: Objective[] = [
   {
     id: 'objective-hardness',
+    outputId: 'output-hardness',
+    targetId: 'target-hardness',
     name: 'Hardness',
     direction: 'Maximize',
     unit: '',
@@ -59,6 +61,8 @@ export const initialObjectives: Objective[] = [
   },
   {
     id: 'objective-brittleness',
+    outputId: 'output-brittleness',
+    targetId: 'target-brittleness',
     name: 'Brittleness',
     direction: 'Minimize',
     unit: '',
@@ -66,6 +70,8 @@ export const initialObjectives: Objective[] = [
   },
   {
     id: 'objective-cost',
+    outputId: 'output-cost',
+    targetId: 'target-cost',
     name: 'Cost',
     direction: 'Minimize',
     unit: '',
@@ -73,6 +79,8 @@ export const initialObjectives: Objective[] = [
   },
   {
     id: 'objective-actual-curing-time',
+    outputId: 'output-actual-curing-time',
+    targetId: 'target-actual-curing-time',
     name: 'Actual Curing Time',
     direction: 'Minimize',
     unit: '',

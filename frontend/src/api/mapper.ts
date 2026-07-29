@@ -11,6 +11,7 @@ import type {
   ConstraintState,
 } from '../pages/campaigns/demo-v2/types'
 import type {
+  ConstraintSpecDto,
   ConstraintSpecInput,
   CreateCampaignRunBody,
   DesignSpaceBody,
@@ -131,18 +132,18 @@ function objectiveArtifacts(objectives: Objective[]): {
     const unit = optionalText(objective.unit)
     const description = optionalText(objective.description)
     return {
-      id: objective.id,
+      id: objective.outputId,
       name: objective.name.trim(),
       ...(unit === undefined ? {} : { unit }),
       ...(description === undefined ? {} : { description }),
     }
   })
 
-  // Each objective maps to one output and one target that share its id, so a
-  // round-trip reconstructs the same objective deterministically.
+  // Output and target keep their own IDs (server-assigned on hydrate, freshly
+  // minted for new rows) so a round-trip never rewrites what the backend stored.
   const targets: TargetSpecInput[] = objectives.map((objective) => ({
-    id: objective.id,
-    outputId: objective.id,
+    id: objective.targetId,
+    outputId: objective.outputId,
     direction: objective.direction,
   }))
 
@@ -150,7 +151,7 @@ function objectiveArtifacts(objectives: Objective[]): {
     return {
       outputs,
       targets,
-      objectivePolicy: { kind: 'Single', targetId: objectives[0].id },
+      objectivePolicy: { kind: 'Single', targetId: objectives[0].targetId },
       acquisitionFunction: 'qLogEI',
     }
   }
@@ -158,7 +159,7 @@ function objectiveArtifacts(objectives: Objective[]): {
   return {
     outputs,
     targets,
-    objectivePolicy: { kind: 'Pareto', targetIds: objectives.map((o) => o.id) },
+    objectivePolicy: { kind: 'Pareto', targetIds: objectives.map((o) => o.targetId) },
     acquisitionFunction: 'qLogNEHVI',
   }
 }
@@ -270,6 +271,14 @@ export function extractPolicyBase(policy: OptimizationPolicyDto): PolicyBase {
   }
 }
 
+// A concrete reason the loaded run uses a configuration this stage cannot
+// express. When non-empty the page renders read-only rather than risk
+// rewriting the server's config on the next save.
+export interface UnsupportedReason {
+  area: 'parameter' | 'objective' | 'strategy' | 'constraint'
+  detail: string
+}
+
 export interface HydratedRun {
   parameters: Parameter[]
   objectives: Objective[]
@@ -282,13 +291,12 @@ export interface HydratedRun {
   budgetUsed: number
   budgetTotal: number
   batchSize: number
+  // Empty when the run round-trips losslessly through this stage's mapper.
+  unsupported: UnsupportedReason[]
 }
 
-export function hydrateFromView(view: RunViewDto): HydratedRun {
-  const revision = view.pinnedRevision
-  const run = view.campaignRun
-
-  const parameters: Parameter[] = revision.parameters.map((param) => {
+function hydrateParameters(specs: RunViewDto['pinnedRevision']['parameters']): Parameter[] {
+  return specs.map((param) => {
     const unit = param.unit ?? ''
     const description = param.description ?? ''
     const shared = { id: param.id, name: param.name, unit, description }
@@ -305,12 +313,21 @@ export function hydrateFromView(view: RunViewDto): HydratedRun {
     }
     return { ...shared, type: 'Categorical', values: param.values }
   })
+}
+
+export function hydrateFromView(view: RunViewDto): HydratedRun {
+  const revision = view.pinnedRevision
+  const run = view.campaignRun
+
+  const parameters = hydrateParameters(revision.parameters)
 
   const outputsById = new Map(view.pinnedRevision.outputs.map((o) => [o.id, o]))
   const objectives: Objective[] = revision.targets.map((target) => {
     const output = outputsById.get(target.outputId)
     return {
       id: target.id,
+      outputId: target.outputId,
+      targetId: target.id,
       name: output?.name ?? target.id,
       direction: target.direction,
       unit: output?.unit ?? '',
@@ -318,11 +335,7 @@ export function hydrateFromView(view: RunViewDto): HydratedRun {
     }
   })
 
-  const constraint = hydrateConstraint(
-    revision.constraints.length > 0,
-    revision.constraints.some((c) => c.kind === 'LinearEquality'),
-    revision.constraintsConfirmed,
-  )
+  const constraint = hydrateConstraint(revision.constraints, revision.constraintsConfirmed, parameters)
 
   return {
     parameters,
@@ -336,19 +349,139 @@ export function hydrateFromView(view: RunViewDto): HydratedRun {
     budgetUsed: run.budgetUsed,
     budgetTotal: run.budgetTotal,
     batchSize: run.optimizationPolicy.batchSize,
+    unsupported: assessSupport(view),
   }
 }
 
+// The exact fixed-sum shape this stage can author: two parameters (resin +
+// hardener, or the first two), unit coefficients, summing to 100.
+function isStandardFixedSum(
+  constraint: ConstraintSpecDto,
+  parameters: Parameter[],
+): boolean {
+  if (constraint.kind !== 'LinearEquality') return false
+  const expectedIds = fixedSumParameterIdsOrNull(parameters)
+  if (expectedIds === null) return false
+  return (
+    arraysEqual(constraint.parameterIds, expectedIds) &&
+    arraysEqual(constraint.coefficients, [1, 1]) &&
+    constraint.rhs === 100
+  )
+}
+
+function fixedSumParameterIdsOrNull(parameters: Parameter[]): string[] | null {
+  try {
+    return fixedSumParameterIds(parameters)
+  } catch {
+    return null
+  }
+}
+
+function arraysEqual<T>(a: T[], b: T[]): boolean {
+  return a.length === b.length && a.every((value, i) => value === b[i])
+}
+
 function hydrateConstraint(
-  hasAny: boolean,
-  hasLinearEquality: boolean,
+  constraints: ConstraintSpecDto[],
   confirmed: boolean,
+  parameters: Parameter[],
 ): ConstraintState {
-  if (hasLinearEquality) return { choice: 'fixed-sum', customExpression: '' }
-  if (!hasAny) {
+  if (constraints.length === 0) {
     return { choice: confirmed ? 'no-constraint' : null, customExpression: '' }
   }
-  // Only fixed-sum / no-constraint are authored in this stage; any other stored
-  // constraint set is treated as confirmed rather than silently dropped.
-  return { choice: 'no-constraint', customExpression: '' }
+  if (constraints.length === 1 && confirmed && isStandardFixedSum(constraints[0], parameters)) {
+    return { choice: 'fixed-sum', customExpression: '' }
+  }
+  // Anything else is unsupported. Leave the choice unresolved rather than
+  // mislabelling it as no-constraint; the page blocks editing via the
+  // unsupported banner (see assessSupport).
+  return { choice: null, customExpression: '' }
+}
+
+// Detect any loaded configuration this stage cannot represent. Returning a
+// non-empty list puts the page in read-only mode instead of letting a save
+// silently rewrite Desirability/Botorch/inequality/cardinality config down to
+// the small set of shapes the editor understands.
+export function assessSupport(view: RunViewDto): UnsupportedReason[] {
+  const reasons: UnsupportedReason[] = []
+  const revision = view.pinnedRevision
+  const parameters = hydrateParameters(revision.parameters)
+
+  for (const param of revision.parameters) {
+    if (param.type === 'Continuous' && param.bounds.stepsize !== null) {
+      reasons.push({
+        area: 'parameter',
+        detail: `Parameter "${param.name}" uses a bound stepsize, which this editor cannot express.`,
+      })
+    }
+  }
+
+  const policy = view.campaignRun.optimizationPolicy
+  const strategy = policy.strategyConfig
+  if (strategy.kind !== 'TwoPhaseMeta') {
+    reasons.push({
+      area: 'strategy',
+      detail: `Strategy "${strategy.kind}" is not editable in this stage.`,
+    })
+  }
+
+  const objectivePolicy = revision.objectivePolicy
+  const targetIds = revision.targets.map((t) => t.id)
+  if (objectivePolicy.kind === 'Desirability') {
+    reasons.push({
+      area: 'objective',
+      detail: 'Desirability objective policy is not editable in this stage.',
+    })
+  } else if (objectivePolicy.kind === 'Single') {
+    const expectedAcq = 'qLogEI'
+    if (targetIds.length !== 1 || objectivePolicy.targetId !== targetIds[0]) {
+      reasons.push({
+        area: 'objective',
+        detail: 'Single objective policy does not match exactly one target.',
+      })
+    }
+    if (strategy.kind === 'TwoPhaseMeta' && strategy.acquisitionFunction !== expectedAcq) {
+      reasons.push({
+        area: 'strategy',
+        detail: `Acquisition "${strategy.acquisitionFunction}" is not the ${expectedAcq} this stage pairs with a single objective.`,
+      })
+    }
+  } else {
+    const expectedAcq = 'qLogNEHVI'
+    if (targetIds.length < 2 || !arraysEqual(objectivePolicy.targetIds, targetIds)) {
+      reasons.push({
+        area: 'objective',
+        detail: 'Pareto objective policy does not reference every target in order.',
+      })
+    }
+    if (strategy.kind === 'TwoPhaseMeta' && strategy.acquisitionFunction !== expectedAcq) {
+      reasons.push({
+        area: 'strategy',
+        detail: `Acquisition "${strategy.acquisitionFunction}" is not the ${expectedAcq} this stage pairs with multiple objectives.`,
+      })
+    }
+  }
+
+  const constraints = revision.constraints
+  if (constraints.length > 1) {
+    reasons.push({
+      area: 'constraint',
+      detail: 'Multiple constraints are not editable in this stage.',
+    })
+  } else if (constraints.length === 1) {
+    const only = constraints[0]
+    if (!isStandardFixedSum(only, parameters)) {
+      reasons.push({
+        area: 'constraint',
+        detail: `Constraint "${only.kind}" is not the standard fixed-sum shape this stage can edit.`,
+      })
+    } else if (!revision.constraintsConfirmed) {
+      reasons.push({
+        area: 'constraint',
+        detail: 'The fixed-sum constraint is stored unconfirmed, which this editor cannot represent.',
+      })
+    }
+  }
+
+  return reasons
 }

@@ -41,7 +41,12 @@ export interface ParameterFieldErrors {
 }
 
 export interface Objective {
+  // Frontend row identity (React keys, dedup, edit/delete). Distinct from the
+  // server-side outputId/targetId so a hydrate -> save round-trip never rewrites
+  // the IDs the backend assigned.
   id: string
+  outputId: string
+  targetId: string
   name: string
   direction: 'Maximize' | 'Minimize'
   unit: string

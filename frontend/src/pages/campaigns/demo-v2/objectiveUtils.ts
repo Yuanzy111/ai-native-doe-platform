@@ -1,8 +1,16 @@
 import type { Objective, ObjectiveFieldErrors } from './types'
 
 export function createEmptyObjective(): Objective {
-  const id = `objective-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-  return { id, name: '', direction: 'Maximize', unit: '', description: '' }
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  return {
+    id: `objective-${suffix}`,
+    outputId: `output-${suffix}`,
+    targetId: `target-${suffix}`,
+    name: '',
+    direction: 'Maximize',
+    unit: '',
+    description: '',
+  }
 }
 
 export function getObjectiveIssues(

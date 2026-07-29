@@ -3,6 +3,7 @@ import { isObjectiveValid } from '../objectiveUtils'
 
 interface Props {
   objectives: Objective[]
+  locked: boolean
   onEdit: (objective: Objective) => void
   onDelete: (id: string) => void
 }
@@ -12,12 +13,12 @@ const directionStyles: Record<Objective['direction'], string> = {
   Minimize: 'bg-sky-50 text-sky-700',
 }
 
-export default function ObjectivesTable({ objectives, onEdit, onDelete }: Props) {
+export default function ObjectivesTable({ objectives, locked, onEdit, onDelete }: Props) {
   if (objectives.length === 0) {
     return <p className="text-sm text-slate-400">No objectives configured yet.</p>
   }
 
-  const canDelete = objectives.length > 1
+  const canDelete = objectives.length > 1 && !locked
 
   return (
     <table className="w-full border-collapse text-left text-sm">
@@ -56,8 +57,9 @@ export default function ObjectivesTable({ objectives, onEdit, onDelete }: Props)
               <td className="py-1.5 text-right">
                 <button
                   type="button"
+                  disabled={locked}
                   onClick={() => onEdit(obj)}
-                  className="mr-2 text-xs font-medium text-indigo-600 hover:text-indigo-500"
+                  className="mr-2 text-xs font-medium text-indigo-600 hover:text-indigo-500 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:text-slate-300"
                 >
                   Edit
                 </button>

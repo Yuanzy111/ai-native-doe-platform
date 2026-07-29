@@ -3,11 +3,12 @@ import { formatParameterRange, isParameterValid } from '../parameterUtils'
 
 interface Props {
   parameters: Parameter[]
+  locked: boolean
   onEdit: (parameter: Parameter) => void
   onDelete: (id: string) => void
 }
 
-export default function ParametersTable({ parameters, onEdit, onDelete }: Props) {
+export default function ParametersTable({ parameters, locked, onEdit, onDelete }: Props) {
   if (parameters.length === 0) {
     return <p className="text-sm text-slate-400">No parameters configured yet.</p>
   }
@@ -49,15 +50,17 @@ export default function ParametersTable({ parameters, onEdit, onDelete }: Props)
               <td className="py-1.5 text-right">
                 <button
                   type="button"
+                  disabled={locked}
                   onClick={() => onEdit(param)}
-                  className="mr-2 text-xs font-medium text-indigo-600 hover:text-indigo-500"
+                  className="mr-2 text-xs font-medium text-indigo-600 hover:text-indigo-500 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:text-slate-300"
                 >
                   Edit
                 </button>
                 <button
                   type="button"
+                  disabled={locked}
                   onClick={() => onDelete(param.id)}
-                  className="text-xs font-medium text-slate-500 hover:text-red-600"
+                  className="text-xs font-medium text-slate-500 hover:text-red-600 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:text-slate-300"
                 >
                   Delete
                 </button>

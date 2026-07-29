@@ -1,5 +1,6 @@
 import type { CampaignData, ConstraintState, Objective, Parameter } from '../types'
 import type { ValidationIssueDto } from '../../../../api/types'
+import type { UnsupportedReason } from '../../../../api/mapper'
 import { getConstraintDisplayText, isConstraintResolved } from '../constraintUtils'
 import { areParametersValid } from '../parameterUtils'
 import { areObjectivesValid } from '../objectiveUtils'
@@ -13,6 +14,8 @@ interface Props {
   objectives: Objective[]
   constraint: ConstraintState
   blockingIssues: ValidationIssueDto[]
+  unsupported: UnsupportedReason[]
+  locked: boolean
   onAddParameter: () => void
   onEditParameter: (parameter: Parameter) => void
   onDeleteParameter: (id: string) => void
@@ -27,6 +30,8 @@ export default function MainWorkspace({
   objectives,
   constraint,
   blockingIssues,
+  unsupported,
+  locked,
   onAddParameter,
   onEditParameter,
   onDeleteParameter,
@@ -43,6 +48,25 @@ export default function MainWorkspace({
   return (
     <main className="flex-1 overflow-y-auto bg-slate-50">
       <div className="mx-auto max-w-4xl bg-white">
+        {unsupported.length > 0 && (
+          <div className="border-b border-amber-200 bg-amber-50 px-6 py-4">
+            <p className="text-sm font-semibold text-amber-900">Unsupported configuration</p>
+            <p className="mt-1 text-xs text-amber-800">
+              This run uses configuration this stage cannot edit. It is shown read-only; editing,
+              saving, validating, and generating are disabled to avoid overwriting the server’s
+              configuration.
+            </p>
+            <ul className="mt-2 flex list-disc flex-col gap-1 pl-5 text-xs text-amber-800">
+              {unsupported.map((reason) => (
+                <li key={`${reason.area}-${reason.detail}`}>
+                  <span className="font-medium uppercase tracking-wide">{reason.area}</span>:{' '}
+                  {reason.detail}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         <Section title="Campaign Goal">
           <p className="text-sm leading-relaxed text-slate-700">{data.goal}</p>
         </Section>
@@ -53,7 +77,8 @@ export default function MainWorkspace({
             <button
               type="button"
               onClick={onAddParameter}
-              className="rounded border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+              disabled={locked}
+              className="rounded border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
             >
               + Add Parameter
             </button>
@@ -61,6 +86,7 @@ export default function MainWorkspace({
         >
           <ParametersTable
             parameters={parameters}
+            locked={locked}
             onEdit={onEditParameter}
             onDelete={onDeleteParameter}
           />
@@ -72,7 +98,8 @@ export default function MainWorkspace({
             <button
               type="button"
               onClick={onAddObjective}
-              className="rounded border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+              disabled={locked}
+              className="rounded border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
             >
               + Add Objective
             </button>
@@ -80,6 +107,7 @@ export default function MainWorkspace({
         >
           <ObjectivesTable
             objectives={objectives}
+            locked={locked}
             onEdit={onEditObjective}
             onDelete={onDeleteObjective}
           />

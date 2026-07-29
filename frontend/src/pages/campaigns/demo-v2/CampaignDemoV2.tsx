@@ -26,6 +26,7 @@ import {
   toDesignSpaceBody,
   type DesignSpaceInputs,
   type PolicyBase,
+  type UnsupportedReason,
 } from '../../../api/mapper'
 import type { RunStatus, RunViewDto, ValidationIssueDto } from '../../../api/types'
 
@@ -57,6 +58,12 @@ function writeRunIdToUrl(runId: string): void {
   window.history.replaceState(null, '', url)
 }
 
+function clearRunIdFromUrl(): void {
+  const url = new URL(window.location.href)
+  url.searchParams.delete('runId')
+  window.history.replaceState(null, '', url)
+}
+
 export default function CampaignDemoV2() {
   const [parameters, setParameters] = useState<Parameter[]>(initialParameters)
   const [editingParameter, setEditingParameter] = useState<Parameter | null>(null)
@@ -78,6 +85,8 @@ export default function CampaignDemoV2() {
   const [meta, setMeta] = useState<HeaderMeta>(DEFAULT_META)
   const [dirty, setDirty] = useState(false)
   const [blockingIssues, setBlockingIssues] = useState<ValidationIssueDto[]>([])
+  const [unsupported, setUnsupported] = useState<UnsupportedReason[]>([])
+  const [restoreError, setRestoreError] = useState<string | null>(null)
 
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -100,8 +109,28 @@ export default function CampaignDemoV2() {
       budgetTotal: hydrated.budgetTotal,
       batchSize: hydrated.batchSize,
     })
+    setUnsupported(hydrated.unsupported)
     setDirty(false)
     setBlockingIssues([])
+  }
+
+  // Load a run by id, surfacing failures as an explicit error screen (with
+  // Retry / Start New Draft) rather than leaving an editable default page bound
+  // to a runId the server rejected.
+  const loadRun = (id: string) => {
+    setRunId(id)
+    setRestoreError(null)
+    setLoading(true)
+    getCampaignRun(id)
+      .then(applyView)
+      .catch((err: unknown) => {
+        const message =
+          err instanceof ApiError
+            ? `Could not restore run: ${err.code}: ${err.message}`
+            : 'Could not restore the campaign run.'
+        setRestoreError(message)
+      })
+      .finally(() => setLoading(false))
   }
 
   // Restore an existing run from `?runId` on first load.
@@ -110,32 +139,38 @@ export default function CampaignDemoV2() {
     if (restored.current) return
     restored.current = true
     const existingId = readRunIdFromUrl()
-    if (existingId === null) return
+    if (existingId !== null) loadRun(existingId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
-    setRunId(existingId)
-    setLoading(true)
-    getCampaignRun(existingId)
-      .then(applyView)
-      .catch((err: unknown) => {
-        const message =
-          err instanceof ApiError
-            ? `Could not restore run: ${err.message}`
-            : 'Could not restore the campaign run.'
-        pushToast('warning', message)
-      })
-      .finally(() => setLoading(false))
-  }, [pushToast])
+  const startNewDraft = () => {
+    clearRunIdFromUrl()
+    setRunId(null)
+    setServerStatus(null)
+    setPolicyBase(DEFAULT_POLICY_BASE)
+    setMeta(DEFAULT_META)
+    setParameters(initialParameters)
+    setObjectives(initialObjectives)
+    setConstraint({ choice: null, customExpression: '' })
+    setUnsupported([])
+    setBlockingIssues([])
+    setDirty(false)
+    setRestoreError(null)
+  }
 
   const markDirty = () => {
     setDirty(true)
     setBlockingIssues([])
   }
 
+  const locked = unsupported.length > 0
+
   const experimentSummary = `${parameters.length} 个参数、${objectives.length} 个优化目标已配置完成,尚未生成首轮实验推荐。`
   const status = displayStatus(serverStatus, dirty)
-  const canGenerate = canGenerateInitialDesign(serverStatus, dirty)
+  const canGenerate = canGenerateInitialDesign(serverStatus, dirty) && !locked
 
   const handleChooseConstraint = (choice: ConstraintChoice) => {
+    if (locked) return
     if (choice === 'custom') {
       setConstraintDialogOpen(true)
       return
@@ -151,16 +186,19 @@ export default function CampaignDemoV2() {
   }
 
   const handleAddParameter = () => {
+    if (locked) return
     setEditingParameter(null)
     setParameterDialogOpen(true)
   }
 
   const handleEditParameter = (parameter: Parameter) => {
+    if (locked) return
     setEditingParameter(parameter)
     setParameterDialogOpen(true)
   }
 
   const handleDeleteParameter = (id: string) => {
+    if (locked) return
     setParameters((current) => current.filter((param) => param.id !== id))
     markDirty()
   }
@@ -177,16 +215,19 @@ export default function CampaignDemoV2() {
   }
 
   const handleAddObjective = () => {
+    if (locked) return
     setEditingObjective(null)
     setObjectiveDialogOpen(true)
   }
 
   const handleEditObjective = (objective: Objective) => {
+    if (locked) return
     setEditingObjective(objective)
     setObjectiveDialogOpen(true)
   }
 
   const handleDeleteObjective = (id: string) => {
+    if (locked) return
     setObjectives((current) => current.filter((objective) => objective.id !== id))
     markDirty()
   }
@@ -212,7 +253,7 @@ export default function CampaignDemoV2() {
   // Persist the current design space. Returns the fresh view on success, or
   // null when a mapping/API error was surfaced to the user.
   const persist = async (): Promise<RunViewDto | null> => {
-    if (saving) return null
+    if (saving || locked) return null
     const inputs = buildInputs()
 
     let payload:
@@ -272,7 +313,7 @@ export default function CampaignDemoV2() {
   }
 
   const handleValidate = async () => {
-    if (validating || saving) return
+    if (validating || saving || locked) return
 
     let targetRunId = runId
     if (dirty || runId === null) {
@@ -316,7 +357,7 @@ export default function CampaignDemoV2() {
   }
 
   const handleGenerateDesign = () => {
-    if (!canGenerate) return
+    if (!canGenerate || locked) return
     pushToast('info', 'Initial design generation is not wired up in this stage.')
   }
 
@@ -326,6 +367,36 @@ export default function CampaignDemoV2() {
     return (
       <div className="flex h-screen items-center justify-center bg-slate-50 text-sm text-slate-500">
         Loading campaign run…
+      </div>
+    )
+  }
+
+  if (restoreError !== null) {
+    return (
+      <div className="flex h-screen flex-col items-center justify-center gap-4 bg-slate-50 px-6 text-center">
+        <div className="max-w-md">
+          <h1 className="text-base font-semibold text-slate-900">Couldn’t load this campaign run</h1>
+          <p className="mt-1 text-sm text-slate-600">{restoreError}</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              const id = runId
+              if (id !== null) loadRun(id)
+            }}
+            className="rounded border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+          >
+            Retry
+          </button>
+          <button
+            type="button"
+            onClick={startNewDraft}
+            className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500"
+          >
+            Start New Draft
+          </button>
+        </div>
       </div>
     )
   }
@@ -343,6 +414,7 @@ export default function CampaignDemoV2() {
         canGenerate={canGenerate}
         saving={saving}
         validating={validating}
+        locked={locked}
         onSave={handleSave}
         onValidate={() => void handleValidate()}
         onGenerateDesign={handleGenerateDesign}
@@ -355,6 +427,8 @@ export default function CampaignDemoV2() {
           objectives={objectives}
           constraint={constraint}
           blockingIssues={blockingIssues}
+          unsupported={unsupported}
+          locked={locked}
           onAddParameter={handleAddParameter}
           onEditParameter={handleEditParameter}
           onDeleteParameter={handleDeleteParameter}
