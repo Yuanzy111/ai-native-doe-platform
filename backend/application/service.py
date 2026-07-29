@@ -74,6 +74,15 @@ class ServiceError(Exception):
     """Raised when an application-level invariant is violated."""
 
 
+class EntityNotFoundError(ServiceError):
+    """Raised when a referenced run/round/revision does not exist.
+
+    A subclass of :class:`ServiceError` so existing ``pytest.raises(ServiceError)``
+    call sites keep matching, while callers that care about the difference (the
+    HTTP layer mapping to ``404`` versus ``409``) can catch it specifically.
+    """
+
+
 def _now() -> datetime:
     """Return the current timezone-aware timestamp."""
     return datetime.now(timezone.utc)
@@ -198,6 +207,39 @@ class ApplicationService:
                 )
             self._repo.add_run(run)
             return run
+
+    def create_campaign_with_run(
+        self,
+        definition: CampaignDefinition,
+        first_revision: CampaignDefinitionRevision,
+        run: CampaignRun,
+    ) -> CampaignRun:
+        """Create a definition, its first revision, and a run in one transaction.
+
+        This is the single write path behind ``POST /campaign-runs``: the three
+        aggregates are created together so a failure creating the run cannot leave
+        a dangling campaign or revision behind. All the invariants enforced by
+        :meth:`create_campaign` and :meth:`create_run` still apply — they are
+        reused here inside one outer (reentrant) transaction.
+
+        Args:
+            definition: The campaign container; its ``headRevisionId`` must point
+                at ``first_revision``.
+            first_revision: The revision-1 snapshot owned by ``definition``.
+            run: The Draft run pinning ``first_revision``.
+
+        Returns:
+            The persisted run.
+
+        Raises:
+            ServiceError: If the three do not reference each other consistently or
+                the run's initial state is not clean.
+            PersistenceError: If any insert violates a persistence invariant (the
+                whole unit of work rolls back).
+        """
+        with self._repo.transaction():
+            self.create_campaign(definition, first_revision)
+            return self.create_run(run)
 
     # Run state changes -----------------------------------------------------
 
@@ -1032,10 +1074,10 @@ class ApplicationService:
             )
 
     def _require_run(self, run_id: str) -> CampaignRun:
-        """Fetch a run or raise a :class:`ServiceError`."""
+        """Fetch a run or raise an :class:`EntityNotFoundError`."""
         run = self._repo.get_run(run_id)
         if run is None:
-            raise ServiceError(f"Unknown run {run_id!r}.")
+            raise EntityNotFoundError(f"Unknown run {run_id!r}.")
         return run
 
     def _require_editable(self, run: CampaignRun) -> None:
@@ -1050,7 +1092,7 @@ class ApplicationService:
         """Fetch a round and assert it belongs to ``run_id``."""
         experiment_round = self._repo.get_round(round_id)
         if experiment_round is None:
-            raise ServiceError(f"Unknown round {round_id!r}.")
+            raise EntityNotFoundError(f"Unknown round {round_id!r}.")
         if experiment_round.campaign_run_id != run_id:
             raise ServiceError(
                 f"Round {round_id!r} does not belong to run {run_id!r}."
@@ -1081,4 +1123,9 @@ class ApplicationService:
         return [issue.code for issue in result.blocking_issues]
 
 
-__all__ = ["ApplicationService", "ServiceError", "PersistenceError"]
+__all__ = [
+    "ApplicationService",
+    "ServiceError",
+    "EntityNotFoundError",
+    "PersistenceError",
+]
