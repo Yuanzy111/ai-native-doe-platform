@@ -90,6 +90,7 @@ describe('toDesignSpaceBody', () => {
       {
         kind: 'LinearEquality',
         id: 'constraint-fixed-sum',
+        resolvedAt: null,
         parameterIds: ['p-resin', 'p-hardener'],
         coefficients: [1, 1],
         rhs: 100,
@@ -442,12 +443,44 @@ describe('lossless GET -> (no edit) -> PUT round-trip', () => {
       {
         kind: 'LinearEquality',
         id: 'constraint-fixed-sum',
+        resolvedAt: null,
         parameterIds: ['p-resin', 'p-hardener'],
         coefficients: [1, 1],
         rhs: 100,
       },
     ])
     expect(body.constraintsConfirmed).toBe(true)
+  })
+
+  it('preserves an arbitrary fixed-sum id and non-null resolvedAt through a save', () => {
+    const view = buildView({
+      constraints: [
+        {
+          ...FIXED_SUM,
+          id: 'srv-generated-99',
+          resolvedAt: '2026-02-03T10:00:00Z',
+        },
+      ],
+      constraintsConfirmed: true,
+    })
+    const hydrated = hydrateFromView(view)
+    expect(hydrated.unsupported).toEqual([])
+    expect(hydrated.constraint).toMatchObject({
+      choice: 'fixed-sum',
+      constraintId: 'srv-generated-99',
+      resolvedAt: '2026-02-03T10:00:00Z',
+    })
+    const body = toDesignSpaceBody(hydrated)
+    expect(body.constraints).toEqual([
+      {
+        kind: 'LinearEquality',
+        id: 'srv-generated-99',
+        resolvedAt: '2026-02-03T10:00:00Z',
+        parameterIds: ['p-resin', 'p-hardener'],
+        coefficients: [1, 1],
+        rhs: 100,
+      },
+    ])
   })
 })
 
@@ -533,5 +566,49 @@ describe('assessSupport flags configurations this stage cannot express', () => {
     )
     expect(hydrated.constraint.choice).toBeNull()
     expect(hydrated.unsupported.some((r) => r.area === 'constraint')).toBe(true)
+  })
+
+  it('flags outputs and targets stored in a different order', () => {
+    const reasons = assessSupport(
+      buildView({
+        outputs: [
+          { id: 'out-a', name: 'A', unit: null, description: null },
+          { id: 'out-b', name: 'B', unit: null, description: null },
+        ],
+        targets: [
+          { id: 'tgt-b', outputId: 'out-b', direction: 'Maximize', targetValue: null },
+          { id: 'tgt-a', outputId: 'out-a', direction: 'Minimize', targetValue: null },
+        ],
+        objectivePolicy: { kind: 'Pareto', targetIds: ['tgt-b', 'tgt-a'] },
+        strategyConfig: { ...TWO_PHASE_QLOGEI, acquisitionFunction: 'qLogNEHVI' },
+      }),
+    )
+    expect(reasons.some((r) => r.area === 'objective')).toBe(true)
+  })
+
+  it('flags an output that no target references', () => {
+    const reasons = assessSupport(
+      buildView({
+        outputs: [
+          { id: 'out-h', name: 'Hardness', unit: null, description: null },
+          { id: 'out-orphan', name: 'Orphan', unit: null, description: null },
+        ],
+      }),
+    )
+    expect(
+      reasons.some((r) => r.area === 'objective' && r.detail.includes('out-orphan')),
+    ).toBe(true)
+  })
+
+  it('flags a target that references a missing output', () => {
+    const reasons = assessSupport(
+      buildView({
+        targets: [{ id: 'tgt-h', outputId: 'out-missing', direction: 'Maximize', targetValue: null }],
+        objectivePolicy: { kind: 'Single', targetId: 'tgt-h' },
+      }),
+    )
+    expect(
+      reasons.some((r) => r.area === 'objective' && r.detail.includes('out-missing')),
+    ).toBe(true)
   })
 })

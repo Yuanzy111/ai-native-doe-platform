@@ -10,6 +10,7 @@ import ToastStack from './components/ToastStack'
 import { campaignData, initialObjectives, initialParameters, stages } from './mockData'
 import { useToasts } from './useToasts'
 import { canGenerateInitialDesign, displayStatus } from './runState'
+import { newFixedSumConstraintId } from './constraintUtils'
 import type { ConstraintChoice, ConstraintState, Objective, Parameter } from './types'
 import { ApiError } from '../../../api/client'
 import {
@@ -175,7 +176,18 @@ export default function CampaignDemoV2() {
       setConstraintDialogOpen(true)
       return
     }
-    setConstraint({ choice, customExpression: '' })
+    if (choice === 'fixed-sum') {
+      // A freshly authored fixed-sum gets a new stable id and a null resolvedAt;
+      // a hydrated one keeps the server's values via applyView.
+      setConstraint({
+        choice,
+        customExpression: '',
+        constraintId: newFixedSumConstraintId(),
+        resolvedAt: null,
+      })
+    } else {
+      setConstraint({ choice, customExpression: '' })
+    }
     markDirty()
   }
 
@@ -440,6 +452,7 @@ export default function CampaignDemoV2() {
           copilot={campaignData.copilot}
           experimentSummary={experimentSummary}
           constraint={constraint}
+          locked={locked}
           onChoose={handleChooseConstraint}
         />
       </div>

@@ -239,6 +239,7 @@ export type ObjectivePolicyInput =
 export interface LinearEqualityConstraintInput {
   kind: 'LinearEquality'
   id: string
+  resolvedAt: string | null
   parameterIds: string[]
   coefficients: number[]
   rhs: number

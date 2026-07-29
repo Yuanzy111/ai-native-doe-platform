@@ -1,5 +1,9 @@
 import type { ConstraintState } from './types'
 
+export function newFixedSumConstraintId(): string {
+  return `constraint-fixed-sum-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+}
+
 export function isConstraintResolved(constraint: ConstraintState): boolean {
   if (constraint.choice === null) return false
   if (constraint.choice === 'custom') return constraint.customExpression.trim().length > 0

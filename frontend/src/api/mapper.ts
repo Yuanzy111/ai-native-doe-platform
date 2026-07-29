@@ -14,6 +14,7 @@ import type {
   ConstraintSpecDto,
   ConstraintSpecInput,
   CreateCampaignRunBody,
+  LinearEqualityConstraintDto,
   DesignSpaceBody,
   ObjectivePolicyInput,
   OptimizationPolicyDto,
@@ -188,7 +189,10 @@ function constraintArtifacts(
         constraints: [
           {
             kind: 'LinearEquality',
-            id: 'constraint-fixed-sum',
+            // Keep the server-assigned id/resolvedAt when hydrated; a freshly
+            // authored fixed-sum carries a new stable id and a null resolvedAt.
+            id: constraint.constraintId ?? 'constraint-fixed-sum',
+            resolvedAt: constraint.resolvedAt ?? null,
             parameterIds,
             coefficients: [1, 1],
             rhs: 100,
@@ -381,6 +385,13 @@ function arraysEqual<T>(a: T[], b: T[]): boolean {
   return a.length === b.length && a.every((value, i) => value === b[i])
 }
 
+// True when both lists hold the same multiset of values (order aside).
+function isPermutation<T>(a: T[], b: T[]): boolean {
+  if (a.length !== b.length) return false
+  const sortKey = (list: T[]) => [...list].map(String).sort().join(' ')
+  return sortKey(a) === sortKey(b)
+}
+
 function hydrateConstraint(
   constraints: ConstraintSpecDto[],
   confirmed: boolean,
@@ -390,7 +401,13 @@ function hydrateConstraint(
     return { choice: confirmed ? 'no-constraint' : null, customExpression: '' }
   }
   if (constraints.length === 1 && confirmed && isStandardFixedSum(constraints[0], parameters)) {
-    return { choice: 'fixed-sum', customExpression: '' }
+    const only = constraints[0] as LinearEqualityConstraintDto
+    return {
+      choice: 'fixed-sum',
+      customExpression: '',
+      constraintId: only.id,
+      resolvedAt: only.resolvedAt,
+    }
   }
   // Anything else is unsupported. Leave the choice unresolved rather than
   // mislabelling it as no-constraint; the page blocks editing via the
@@ -422,6 +439,41 @@ export function assessSupport(view: RunViewDto): UnsupportedReason[] {
     reasons.push({
       area: 'strategy',
       detail: `Strategy "${strategy.kind}" is not editable in this stage.`,
+    })
+  }
+
+  // The objective list is one row per target, in target order, and each row
+  // owns exactly one output. If the stored outputs/targets don't form that
+  // one-to-one, same-order shape, a save would drop, duplicate, or reorder
+  // them, so refuse to edit instead.
+  const outputIds = revision.outputs.map((o) => o.id)
+  const referencedOutputIds = revision.targets.map((t) => t.outputId)
+  for (const target of revision.targets) {
+    if (!outputIds.includes(target.outputId)) {
+      reasons.push({
+        area: 'objective',
+        detail: `Target "${target.id}" references a missing output "${target.outputId}".`,
+      })
+    }
+  }
+  for (const output of revision.outputs) {
+    const references = referencedOutputIds.filter((id) => id === output.id).length
+    if (references === 0) {
+      reasons.push({
+        area: 'objective',
+        detail: `Output "${output.id}" is not referenced by any target.`,
+      })
+    } else if (references > 1) {
+      reasons.push({
+        area: 'objective',
+        detail: `Output "${output.id}" is referenced by ${references} targets.`,
+      })
+    }
+  }
+  if (isPermutation(outputIds, referencedOutputIds) && !arraysEqual(outputIds, referencedOutputIds)) {
+    reasons.push({
+      area: 'objective',
+      detail: 'Outputs and targets are stored in a different order; this stage would reorder them on save.',
     })
   }
 

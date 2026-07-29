@@ -6,6 +6,7 @@ interface Props {
   copilot: CampaignData['copilot']
   experimentSummary: string
   constraint: ConstraintState
+  locked: boolean
   onChoose: (choice: ConstraintChoice) => void
 }
 
@@ -26,13 +27,21 @@ function CopilotBlock({
   )
 }
 
-export default function CopilotPanel({ copilot, experimentSummary, constraint, onChoose }: Props) {
+export default function CopilotPanel({
+  copilot,
+  experimentSummary,
+  constraint,
+  locked,
+  onChoose,
+}: Props) {
   const resolved = isConstraintResolved(constraint)
   const constraintText = getConstraintDisplayText(constraint)
-  const missingInformation = resolved ? [] : [copilot.constraintMissingInfo]
-  const suggestedNextStep = resolved
-    ? copilot.suggestedNextStepResolved
-    : copilot.suggestedNextStepPending
+  const missingInformation = locked || resolved ? [] : [copilot.constraintMissingInfo]
+  const suggestedNextStep = locked
+    ? 'This run is read-only. Its configuration cannot be edited in this stage.'
+    : resolved
+      ? copilot.suggestedNextStepResolved
+      : copilot.suggestedNextStepPending
 
   return (
     <aside className="flex w-[360px] shrink-0 flex-col border-l border-slate-200 bg-white">
@@ -76,8 +85,17 @@ export default function CopilotPanel({ copilot, experimentSummary, constraint, o
           <p className="text-sm leading-relaxed text-slate-700">{suggestedNextStep}</p>
         </CopilotBlock>
 
-        <CopilotBlock label={resolved ? 'Resolved Constraint' : 'Pending Confirmation'}>
-          {resolved ? (
+        <CopilotBlock
+          label={locked ? 'Configuration (read-only)' : resolved ? 'Resolved Constraint' : 'Pending Confirmation'}
+        >
+          {locked ? (
+            <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2.5">
+              <p className="text-sm text-slate-600">
+                This run uses a configuration this stage cannot edit. Constraint choices are
+                disabled to avoid overwriting the server’s configuration.
+              </p>
+            </div>
+          ) : resolved ? (
             <div className="rounded border border-emerald-200 bg-emerald-50 px-3 py-2.5">
               <p className="font-mono text-sm text-emerald-900">{constraintText}</p>
               <span className="mt-1 inline-block text-[11px] font-medium uppercase tracking-wide text-emerald-600">
