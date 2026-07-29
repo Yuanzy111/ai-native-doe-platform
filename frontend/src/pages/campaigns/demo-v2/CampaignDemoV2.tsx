@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import CampaignHeader from './components/CampaignHeader'
 import StageNav from './components/StageNav'
 import MainWorkspace from './components/MainWorkspace'
-import CopilotPanel from './components/CopilotPanel'
+import AgentPanel from './components/AgentPanel'
 import RecommendationsView from './components/RecommendationsView'
 import ConstraintDialog from './components/ConstraintDialog'
 import ParameterDialog from './components/ParameterDialog'
@@ -13,7 +13,7 @@ import { useToasts } from './useToasts'
 import { canGenerateInitialDesign, displayStatus, isLifecycleLocked } from './runState'
 import { newFixedSumConstraintId } from './constraintUtils'
 import {
-  ENABLED_STAGE_KEYS,
+  enabledStageKeys,
   resolveInitialStage,
   selectRecommendationsData,
   type RecommendationsData,
@@ -37,7 +37,20 @@ import {
   type PolicyBase,
   type UnsupportedReason,
 } from '../../../api/mapper'
-import type { RunStatus, RunViewDto, ValidationIssueDto } from '../../../api/types'
+import {
+  approveProposal,
+  getAgentThread,
+  postAgentMessage,
+  rejectProposal,
+} from '../../../api/agent'
+import { canSendMessage } from './agentState'
+import type {
+  AgentMessageDto,
+  AgentProposalDto,
+  RunStatus,
+  RunViewDto,
+  ValidationIssueDto,
+} from '../../../api/types'
 
 interface HeaderMeta {
   title: string
@@ -116,6 +129,13 @@ export default function CampaignDemoV2() {
   const [validating, setValidating] = useState(false)
   const [generating, setGenerating] = useState(false)
 
+  const [agentMessages, setAgentMessages] = useState<AgentMessageDto[]>([])
+  const [agentPendingProposals, setAgentPendingProposals] = useState<AgentProposalDto[]>([])
+  const [agentDraft, setAgentDraft] = useState('')
+  const [agentSending, setAgentSending] = useState(false)
+  const [agentActioningId, setAgentActioningId] = useState<string | null>(null)
+  const [agentError, setAgentError] = useState<string | null>(null)
+
   const { toasts, pushToast, dismissToast } = useToasts()
 
   const applyView = (view: RunViewDto) => {
@@ -139,16 +159,24 @@ export default function CampaignDemoV2() {
     setBlockingIssues([])
   }
 
+  const applyThread = (messages: AgentMessageDto[], pending: AgentProposalDto[]) => {
+    setAgentMessages(messages)
+    setAgentPendingProposals(pending)
+  }
+
   // Load a run by id, surfacing failures as an explicit error screen (with
   // Retry / Start New Draft) rather than leaving an editable default page bound
-  // to a runId the server rejected.
+  // to a runId the server rejected. The agent thread is restored alongside the
+  // run so a refresh brings back the conversation and any pending proposals.
   const loadRun = (id: string) => {
     setRunId(id)
     setRestoreError(null)
+    setAgentError(null)
     setLoading(true)
-    getCampaignRun(id)
-      .then((view) => {
+    Promise.all([getCampaignRun(id), getAgentThread(id)])
+      .then(([view, thread]) => {
         applyView(view)
+        applyThread(thread.messages, thread.pendingProposals)
         setActiveStage(resolveInitialStage(view, readStageFromUrl()))
       })
       .catch((err: unknown) => {
@@ -186,10 +214,14 @@ export default function CampaignDemoV2() {
     setRestoreError(null)
     setRecommendations(null)
     setActiveStage('design-space')
+    setAgentMessages([])
+    setAgentPendingProposals([])
+    setAgentDraft('')
+    setAgentError(null)
   }
 
   const handleSelectStage = (key: StageKey) => {
-    if (!ENABLED_STAGE_KEYS.includes(key)) return
+    if (!enabledStageKeys(recommendations !== null).includes(key)) return
     setActiveStage(key)
     writeStageToUrl(key)
   }
@@ -205,8 +237,16 @@ export default function CampaignDemoV2() {
   const lifecycleLocked = isLifecycleLocked(serverStatus)
   const locked = unsupported.length > 0 || lifecycleLocked
   const hasBatch = recommendations !== null
+  const enabledKeys = enabledStageKeys(hasBatch)
+  // The nav must never highlight Recommendations while the Design Space is on
+  // screen: fall back to design-space whenever no batch exists.
+  const effectiveStage: StageKey = hasBatch ? activeStage : 'design-space'
+  const showRecommendations = effectiveStage === 'recommendations' && recommendations !== null
 
-  const experimentSummary = `${parameters.length} 个参数、${objectives.length} 个优化目标已配置完成,尚未生成首轮实验推荐。`
+  const experimentSummary =
+    recommendations !== null
+      ? `第 ${meta.round} 轮:已生成 ${recommendations.batch.candidates.length} 个候选实验推荐,请在 Recommendations 页面查看。`
+      : `${parameters.length} 个参数、${objectives.length} 个优化目标已配置完成,尚未生成首轮实验推荐。`
   const status = displayStatus(serverStatus, dirty)
   const canGenerate = canGenerateInitialDesign(serverStatus, dirty, hasBatch) && !locked
 
@@ -442,6 +482,84 @@ export default function CampaignDemoV2() {
     }
   }
 
+  // Send a message to the agent. Sending never mutates the campaign; a proposed
+  // action is staged as Pending for explicit approval. When no run exists yet
+  // the draft is persisted first so the agent has a run to work against.
+  const refreshThread = async (id: string) => {
+    const thread = await getAgentThread(id)
+    applyThread(thread.messages, thread.pendingProposals)
+  }
+
+  const handleSendMessage = async () => {
+    if (!canSendMessage(agentDraft, agentSending)) return
+    const message = agentDraft.trim()
+    setAgentError(null)
+    setAgentSending(true)
+    try {
+      let targetRunId = runId
+      if (targetRunId === null) {
+        const view = await persist()
+        if (view === null) return
+        targetRunId = view.campaignRun.id
+      }
+      const thread = await postAgentMessage(targetRunId, message)
+      applyThread(thread.messages, thread.pendingProposals)
+      setAgentDraft('')
+    } catch (err) {
+      setAgentError(
+        err instanceof ApiError ? `${err.code}: ${err.message}` : 'Failed to reach the agent.',
+      )
+    } finally {
+      setAgentSending(false)
+    }
+  }
+
+  const handleApproveProposal = async (proposalId: string) => {
+    if (runId === null || agentActioningId !== null) return
+    setAgentActioningId(proposalId)
+    setAgentError(null)
+    try {
+      const response = await approveProposal(runId, proposalId)
+      applyView(response.view)
+      await refreshThread(runId)
+      // A generate proposal returns a fresh batch; jump to the Recommendations
+      // stage which hydrates from the real backend values (never fabricated).
+      if (response.initialDesign !== null) {
+        setActiveStage('recommendations')
+        writeStageToUrl('recommendations')
+      }
+      pushToast('success', 'Proposal approved.')
+    } catch (err) {
+      setAgentError(
+        err instanceof ApiError ? `${err.code}: ${err.message}` : 'Failed to approve the proposal.',
+      )
+      // Reflect a now-resolved (Failed/stale) proposal in the thread view.
+      try {
+        await refreshThread(runId)
+      } catch {
+        // Leave the thread as-is if the refresh also fails.
+      }
+    } finally {
+      setAgentActioningId(null)
+    }
+  }
+
+  const handleRejectProposal = async (proposalId: string) => {
+    if (runId === null || agentActioningId !== null) return
+    setAgentActioningId(proposalId)
+    setAgentError(null)
+    try {
+      const thread = await rejectProposal(runId, proposalId)
+      applyThread(thread.messages, thread.pendingProposals)
+    } catch (err) {
+      setAgentError(
+        err instanceof ApiError ? `${err.code}: ${err.message}` : 'Failed to reject the proposal.',
+      )
+    } finally {
+      setAgentActioningId(null)
+    }
+  }
+
   const workspaceData = { ...campaignData, title: meta.title, goal: meta.goal }
 
   if (loading) {
@@ -504,39 +622,44 @@ export default function CampaignDemoV2() {
       <div className="flex min-h-0 flex-1">
         <StageNav
           stages={stages}
-          activeKey={activeStage}
-          enabledKeys={ENABLED_STAGE_KEYS}
+          activeKey={effectiveStage}
+          enabledKeys={enabledKeys}
           onSelect={handleSelectStage}
         />
-        {activeStage === 'recommendations' && recommendations !== null ? (
+        {showRecommendations ? (
           <RecommendationsView data={recommendations} parameters={parameters} />
         ) : (
-          <>
-            <MainWorkspace
-              data={workspaceData}
-              parameters={parameters}
-              objectives={objectives}
-              constraint={constraint}
-              blockingIssues={blockingIssues}
-              unsupported={unsupported}
-              locked={locked}
-              onAddParameter={handleAddParameter}
-              onEditParameter={handleEditParameter}
-              onDeleteParameter={handleDeleteParameter}
-              onAddObjective={handleAddObjective}
-              onEditObjective={handleEditObjective}
-              onDeleteObjective={handleDeleteObjective}
-            />
-            <CopilotPanel
-              copilot={campaignData.copilot}
-              experimentSummary={experimentSummary}
-              constraint={constraint}
-              locked={locked}
-              frozen={lifecycleLocked}
-              onChoose={handleChooseConstraint}
-            />
-          </>
+          <MainWorkspace
+            data={workspaceData}
+            parameters={parameters}
+            objectives={objectives}
+            constraint={constraint}
+            blockingIssues={blockingIssues}
+            unsupported={unsupported}
+            locked={locked}
+            onAddParameter={handleAddParameter}
+            onEditParameter={handleEditParameter}
+            onDeleteParameter={handleDeleteParameter}
+            onAddObjective={handleAddObjective}
+            onEditObjective={handleEditObjective}
+            onDeleteObjective={handleDeleteObjective}
+            onChooseConstraint={handleChooseConstraint}
+          />
         )}
+        <AgentPanel
+          experimentSummary={experimentSummary}
+          messages={agentMessages}
+          pendingProposals={agentPendingProposals}
+          draft={agentDraft}
+          sending={agentSending}
+          actioningProposalId={agentActioningId}
+          frozen={lifecycleLocked}
+          errorMessage={agentError}
+          onDraftChange={setAgentDraft}
+          onSend={() => void handleSendMessage()}
+          onApprove={(id) => void handleApproveProposal(id)}
+          onReject={(id) => void handleRejectProposal(id)}
+        />
       </div>
 
       <ParameterDialog

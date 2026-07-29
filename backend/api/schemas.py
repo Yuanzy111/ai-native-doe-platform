@@ -79,8 +79,15 @@ class SaveDesignSpaceRequest(_RequestBase):
     optimization_policy: OptimizationPolicyInput
 
 
+class PostAgentMessageRequest(_RequestBase):
+    """The body of ``POST /api/v1/campaign-runs/{runId}/agent/messages``."""
+
+    message: str = Field(min_length=1)
+
+
 __all__ = [
     "CreateCampaignRunRequest",
     "OptimizationPolicyInput",
+    "PostAgentMessageRequest",
     "SaveDesignSpaceRequest",
 ]

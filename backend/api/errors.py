@@ -37,6 +37,13 @@ from backend.adapters.errors import (
     AdapterValidationError,
     UnsupportedFeatureError,
 )
+from backend.agent.errors import (
+    AgentActionRejectedError,
+    AgentModelError,
+    AgentNotConfiguredError,
+    InvalidAgentOutputError,
+    StaleAgentProposalError,
+)
 from backend.application import EntityNotFoundError, ServiceError
 from backend.domain.validation import StateTransitionError
 from backend.persistence import PersistenceError
@@ -146,6 +153,38 @@ def register_exception_handlers(app: FastAPI) -> None:
         # it like a computation failure and never surface the raw message.
         _logger.exception("Adapter error: %s", exc)
         return _json(502, "ADAPTER_ERROR", _ADAPTER_GENERIC_MESSAGE)
+
+    @app.exception_handler(AgentNotConfiguredError)
+    async def _handle_agent_not_configured(
+        _: Request, exc: AgentNotConfiguredError
+    ) -> JSONResponse:
+        return _json(503, "AGENT_NOT_CONFIGURED", str(exc))
+
+    @app.exception_handler(StaleAgentProposalError)
+    async def _handle_stale_proposal(
+        _: Request, exc: StaleAgentProposalError
+    ) -> JSONResponse:
+        return _json(409, "STALE_AGENT_PROPOSAL", str(exc))
+
+    @app.exception_handler(InvalidAgentOutputError)
+    async def _handle_invalid_agent_output(
+        _: Request, exc: InvalidAgentOutputError
+    ) -> JSONResponse:
+        return _json(502, "AGENT_INVALID_OUTPUT", str(exc))
+
+    @app.exception_handler(AgentModelError)
+    async def _handle_agent_model_error(
+        _: Request, exc: AgentModelError
+    ) -> JSONResponse:
+        # The upstream failure message is kept generic (it may name the model or
+        # transport); the key is never present in these messages by construction.
+        return _json(502, "AGENT_MODEL_ERROR", str(exc))
+
+    @app.exception_handler(AgentActionRejectedError)
+    async def _handle_agent_action_rejected(
+        _: Request, exc: AgentActionRejectedError
+    ) -> JSONResponse:
+        return _json(409, "CONFLICT", str(exc))
 
     @app.exception_handler(StateTransitionError)
     async def _handle_state_transition(

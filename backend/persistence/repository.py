@@ -17,6 +17,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from backend.domain.models import (
+    AgentMessage,
+    AgentProposal,
+    AgentProposalStatus,
+    AgentThread,
     CampaignDefinition,
     CampaignDefinitionRevision,
     CampaignRun,
@@ -105,6 +109,32 @@ CREATE TABLE IF NOT EXISTS decision_log (
 );
 CREATE INDEX IF NOT EXISTS ix_log_run
     ON decision_log (campaign_run_id);
+
+CREATE TABLE IF NOT EXISTS agent_thread (
+    id TEXT PRIMARY KEY,
+    campaign_run_id TEXT NOT NULL UNIQUE REFERENCES campaign_run (id),
+    data TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_message (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES agent_thread (id),
+    data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_agent_message_thread
+    ON agent_message (thread_id);
+
+CREATE TABLE IF NOT EXISTS agent_proposal (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES agent_thread (id),
+    campaign_run_id TEXT NOT NULL REFERENCES campaign_run (id),
+    status TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_agent_proposal_run
+    ON agent_proposal (campaign_run_id);
+CREATE INDEX IF NOT EXISTS ix_agent_proposal_thread
+    ON agent_proposal (thread_id);
 """
 
 
@@ -799,6 +829,118 @@ class SqliteRepository:
             (run_id,),
         ).fetchall()
         return [DecisionLog.model_validate_json(row["data"]) for row in rows]
+
+    # Agent (thread/message/proposal) ---------------------------------------
+
+    def get_or_create_thread(self, thread: AgentThread) -> AgentThread:
+        """Return the run's existing thread, or insert and return ``thread``.
+
+        One thread per run (MVP): if a thread already exists for
+        ``thread.campaign_run_id`` it is returned unchanged and the supplied
+        candidate is discarded; otherwise the candidate is inserted.
+        """
+        existing = self._conn.execute(
+            "SELECT data FROM agent_thread WHERE campaign_run_id = ?",
+            (thread.campaign_run_id,),
+        ).fetchone()
+        if existing is not None:
+            return AgentThread.model_validate_json(existing["data"])
+        self._insert(
+            "agent_thread",
+            {
+                "id": thread.id,
+                "campaign_run_id": thread.campaign_run_id,
+                "data": thread.model_dump_json(by_alias=True),
+            },
+        )
+        return thread
+
+    def get_thread_for_run(self, run_id: str) -> AgentThread | None:
+        """Fetch a run's agent thread, or ``None`` if none exists yet."""
+        row = self._conn.execute(
+            "SELECT data FROM agent_thread WHERE campaign_run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return AgentThread.model_validate_json(row["data"]) if row else None
+
+    def add_agent_message(self, message: AgentMessage) -> None:
+        """Append a message to an agent thread."""
+        self._insert(
+            "agent_message",
+            {
+                "id": message.id,
+                "thread_id": message.thread_id,
+                "data": message.model_dump_json(by_alias=True),
+            },
+        )
+
+    def list_agent_messages(self, thread_id: str) -> list[AgentMessage]:
+        """List a thread's messages in insertion order."""
+        rows = self._conn.execute(
+            "SELECT data FROM agent_message WHERE thread_id = ? ORDER BY rowid ASC",
+            (thread_id,),
+        ).fetchall()
+        return [AgentMessage.model_validate_json(row["data"]) for row in rows]
+
+    def add_agent_proposal(self, proposal: AgentProposal) -> None:
+        """Insert a new agent proposal (created Pending)."""
+        self._insert(
+            "agent_proposal",
+            {
+                "id": proposal.id,
+                "thread_id": proposal.thread_id,
+                "campaign_run_id": proposal.campaign_run_id,
+                "status": proposal.status,
+                "data": proposal.model_dump_json(by_alias=True),
+            },
+        )
+
+    def get_agent_proposal(self, proposal_id: str) -> AgentProposal | None:
+        """Fetch an agent proposal by id."""
+        row = self._fetch_one("agent_proposal", proposal_id)
+        return AgentProposal.model_validate_json(row["data"]) if row else None
+
+    def save_agent_proposal(self, proposal: AgentProposal) -> None:
+        """Persist a proposal's resolution (status/resolvedAt/error).
+
+        The owning thread, run, and immutable creation fields never change; only
+        the lifecycle state advances from Pending.
+        """
+        self._guard_immutable(
+            "agent_proposal",
+            proposal.id,
+            {
+                "thread_id": proposal.thread_id,
+                "campaign_run_id": proposal.campaign_run_id,
+            },
+        )
+        existing = self.get_agent_proposal(proposal.id)
+        if existing is None:
+            raise PersistenceError(
+                f"No 'agent_proposal' row with id {proposal.id!r} to update."
+            )
+        self._guard_fields_unchanged(
+            existing,
+            proposal,
+            ["kind", "payload", "base_revision_id", "created_at"],
+        )
+        self._update(
+            "agent_proposal",
+            proposal.id,
+            {
+                "status": proposal.status,
+                "data": proposal.model_dump_json(by_alias=True),
+            },
+        )
+
+    def list_pending_proposals(self, run_id: str) -> list[AgentProposal]:
+        """List a run's Pending proposals in insertion order."""
+        rows = self._conn.execute(
+            "SELECT data FROM agent_proposal WHERE campaign_run_id = ? "
+            "AND status = ? ORDER BY rowid ASC",
+            (run_id, AgentProposalStatus.PENDING.value),
+        ).fetchall()
+        return [AgentProposal.model_validate_json(row["data"]) for row in rows]
 
 
 __all__ = ["PersistenceError", "SqliteRepository"]

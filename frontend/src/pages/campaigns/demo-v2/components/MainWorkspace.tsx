@@ -1,4 +1,10 @@
-import type { CampaignData, ConstraintState, Objective, Parameter } from '../types'
+import type {
+  CampaignData,
+  ConstraintChoice,
+  ConstraintState,
+  Objective,
+  Parameter,
+} from '../types'
 import type { ValidationIssueDto } from '../../../../api/types'
 import type { UnsupportedReason } from '../../../../api/mapper'
 import { getConstraintDisplayText, isConstraintResolved } from '../constraintUtils'
@@ -22,6 +28,7 @@ interface Props {
   onAddObjective: () => void
   onEditObjective: (objective: Objective) => void
   onDeleteObjective: (id: string) => void
+  onChooseConstraint: (choice: ConstraintChoice) => void
 }
 
 export default function MainWorkspace({
@@ -38,6 +45,7 @@ export default function MainWorkspace({
   onAddObjective,
   onEditObjective,
   onDeleteObjective,
+  onChooseConstraint,
 }: Props) {
   const constraintResolved = isConstraintResolved(constraint)
   const constraintText = getConstraintDisplayText(constraint)
@@ -125,10 +133,37 @@ export default function MainWorkspace({
               </div>
             </div>
           ) : (
-            <div className="flex items-start gap-2 rounded border border-amber-200 bg-amber-50 px-3 py-2.5">
-              <span className="mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500" />
-              <p className="text-sm text-amber-800">{data.openConstraintQuestion}</p>
-            </div>
+            <>
+              <div className="flex items-start gap-2 rounded border border-amber-200 bg-amber-50 px-3 py-2.5">
+                <span className="mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500" />
+                <p className="text-sm text-amber-800">{data.openConstraintQuestion}</p>
+              </div>
+              {!locked && (
+                <div className="mt-3 flex flex-col gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => onChooseConstraint('fixed-sum')}
+                    className="rounded border border-slate-300 bg-white px-3 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    Yes, sum equals 100%
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onChooseConstraint('no-constraint')}
+                    className="rounded border border-slate-300 bg-white px-3 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    No fixed-sum constraint
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onChooseConstraint('custom')}
+                    className="rounded border border-slate-300 bg-white px-3 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    Specify another constraint
+                  </button>
+                </div>
+              )}
+            </>
           )}
         </Section>
 

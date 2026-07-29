@@ -13,6 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from backend.agent.model import AgentModel  # noqa: E402
 from backend.application import ApplicationService  # noqa: E402
 from backend.application.adapter import (  # noqa: E402
     OptimizerAdapter,
@@ -20,6 +21,34 @@ from backend.application.adapter import (  # noqa: E402
 )
 from backend.domain import models as m  # noqa: E402  (after sys.path setup)
 from backend.persistence import SqliteRepository  # noqa: E402
+
+
+class FakeAgentModel:
+    """A deterministic :class:`AgentModel` for tests: no network, no openai.
+
+    Returns queued raw JSON strings (each a serialized ``AgentTurn``) in order,
+    one per :meth:`generate` call, and records every call so tests can assert the
+    system prompt and history the service assembled. Queue an invalid string to
+    exercise the parse-failure path.
+    """
+
+    def __init__(self, responses: list[str] | None = None) -> None:
+        self._responses = list(responses or [])
+        self.calls: list[tuple[str, list[dict[str, str]]]] = []
+
+    def queue(self, response: str) -> None:
+        """Append one raw model response to the pending queue."""
+        self._responses.append(response)
+
+    def generate(self, system_prompt: str, messages: list[dict[str, str]]) -> str:
+        self.calls.append((system_prompt, messages))
+        if not self._responses:
+            raise AssertionError("FakeAgentModel was called with no queued response.")
+        return self._responses.pop(0)
+
+
+# Fail loudly if the fake ever drifts out of protocol conformance.
+assert isinstance(FakeAgentModel(), AgentModel)
 
 
 class FakeOptimizerAdapter:
@@ -324,3 +353,9 @@ def seeded_experiment(seeded_run):
         seeded_run.add_round(_round())
         seeded_run.add_experiment_run(_experiment_run())
     return seeded_run
+
+
+@pytest.fixture
+def fake_agent_model():
+    """Return a fresh, empty :class:`FakeAgentModel`."""
+    return FakeAgentModel()

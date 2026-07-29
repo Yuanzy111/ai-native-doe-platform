@@ -1070,7 +1070,104 @@ class DecisionLog(_FrozenBase):
     """The optional id of a related entity."""
 
 
+# Agent v0 (conversational design-space editing) ----------------------------
+
+
+class AgentThread(_Base):
+    """A conversation thread scoped to one campaign run (one per run, MVP)."""
+
+    id: Ident
+    """The stable identifier."""
+
+    campaign_run_id: Ident
+    """The owning :class:`CampaignRun` id."""
+
+    created_at: AwareDatetime
+    """The timezone-aware creation timestamp."""
+
+
+class AgentMessageRole(StrEnum):
+    """The author of an agent message."""
+
+    USER = "user"
+    ASSISTANT = "assistant"
+
+
+class AgentMessage(_Base):
+    """One message in an :class:`AgentThread`, from the user or the assistant."""
+
+    id: Ident
+    """The stable identifier."""
+
+    thread_id: Ident
+    """The owning :class:`AgentThread` id."""
+
+    role: AgentMessageRole
+    """Who authored the message."""
+
+    content: str
+    """The natural-language message text."""
+
+    created_at: AwareDatetime
+    """The timezone-aware creation timestamp."""
+
+
+class AgentProposalStatus(StrEnum):
+    """The lifecycle of a proposed agent action."""
+
+    PENDING = "Pending"
+    APPROVED = "Approved"
+    REJECTED = "Rejected"
+    FAILED = "Failed"
+
+
+class AgentProposal(_Base):
+    """A structured action the agent proposed, awaiting user approval.
+
+    ``payload`` is the serialized :class:`~backend.agent.contract.AgentAction`
+    (the ``kind`` mirrored into the ``kind`` column). ``base_revision_id`` pins
+    the run's ``definitionRevisionId`` at proposal time so a stale approval — one
+    made after the campaign changed underneath it — can be rejected rather than
+    silently overwriting newer work.
+    """
+
+    id: Ident
+    """The stable identifier."""
+
+    thread_id: Ident
+    """The owning :class:`AgentThread` id."""
+
+    campaign_run_id: Ident
+    """The owning :class:`CampaignRun` id."""
+
+    kind: str
+    """The proposed action kind (mirrors ``payload['kind']``)."""
+
+    payload: Annotated[dict[str, Any], AfterValidator(_freeze_dict)]
+    """The serialized proposed action."""
+
+    status: AgentProposalStatus
+    """The proposal's lifecycle state."""
+
+    base_revision_id: Ident
+    """The run's ``definitionRevisionId`` when the proposal was created."""
+
+    created_at: AwareDatetime
+    """The timezone-aware creation timestamp."""
+
+    resolved_at: AwareDatetime | None = None
+    """The timezone-aware approve/reject/fail timestamp, if resolved."""
+
+    error: str | None = None
+    """A human-readable failure message when ``status`` is ``Failed``."""
+
+
 __all__ = [
+    "AgentMessage",
+    "AgentMessageRole",
+    "AgentProposal",
+    "AgentProposalStatus",
+    "AgentThread",
     "AlgorithmConfig",
     "BatchStatus",
     "Bounds",

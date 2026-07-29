@@ -13,6 +13,8 @@ from collections.abc import Iterator
 
 from fastapi import Depends, Header, Request
 
+from backend.agent.model import AgentModel
+from backend.agent.service import AgentService
 from backend.api.errors import ApiError
 from backend.api.query import RunQueryService
 from backend.application import ApplicationService
@@ -59,6 +61,29 @@ def get_query_service(
     return RunQueryService(repository)
 
 
+def get_agent_model(request: Request) -> AgentModel | None:
+    """Return the injected agent model, or ``None`` when unconfigured."""
+    return request.app.state.agent_model
+
+
+def get_agent_service(
+    repository: SqliteRepository = Depends(get_repository),
+    adapter: OptimizerAdapter | None = Depends(get_adapter),
+    agent_model: AgentModel | None = Depends(get_agent_model),
+) -> AgentService:
+    """Build the agent service over the request-scoped repository.
+
+    Composes the same repository with the application and query services (so
+    every approval dispatches through the one authority) plus the injected model.
+    """
+    return AgentService(
+        repository,
+        agent_model,
+        ApplicationService(repository, adapter=adapter),
+        RunQueryService(repository),
+    )
+
+
 def get_actor(x_actor_id: str | None = Header(default=None)) -> str:
     """Resolve the acting identity from the ``X-Actor-Id`` header.
 
@@ -77,6 +102,8 @@ def get_actor(x_actor_id: str | None = Header(default=None)) -> str:
 __all__ = [
     "get_actor",
     "get_adapter",
+    "get_agent_model",
+    "get_agent_service",
     "get_query_service",
     "get_repository",
     "get_service",

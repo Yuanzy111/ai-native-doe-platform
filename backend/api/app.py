@@ -18,8 +18,9 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from backend.agent.model import AgentModel
 from backend.api.errors import register_exception_handlers
-from backend.api.routers import campaign_runs, health
+from backend.api.routers import agent, campaign_runs, health
 from backend.application.adapter import OptimizerAdapter
 from backend.persistence import SqliteRepository
 
@@ -28,6 +29,7 @@ def create_app(
     *,
     db_path: str,
     adapter: OptimizerAdapter | None = None,
+    agent_model: AgentModel | None = None,
 ) -> FastAPI:
     """Build a configured application.
 
@@ -38,6 +40,9 @@ def create_app(
             in-memory database.
         adapter: The optimizer adapter used for recommendation legs. Injectable
             so tests can swap in a fake or the real BayBE adapter.
+        agent_model: The LLM boundary for the agent. Injectable so tests supply a
+            deterministic fake; ``None`` leaves the agent routes reporting
+            ``AGENT_NOT_CONFIGURED`` while the rest of the API still serves.
 
     Returns:
         A ready-to-serve :class:`FastAPI` application.
@@ -55,12 +60,14 @@ def create_app(
     app = FastAPI(title="Industrial Optimization API", version="v1")
     app.state.db_path = db_path
     app.state.adapter = adapter
+    app.state.agent_model = agent_model
 
     _initialize_schema(db_path)
 
     register_exception_handlers(app)
     app.include_router(health.router)
     app.include_router(campaign_runs.router)
+    app.include_router(agent.router)
     return app
 
 

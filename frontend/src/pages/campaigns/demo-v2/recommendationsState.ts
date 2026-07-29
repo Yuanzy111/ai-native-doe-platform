@@ -11,12 +11,14 @@ import type {
 } from '../../../api/types'
 import type { Parameter, StageKey } from './types'
 
-// Only these two stages are interactive in this milestone; the rest render but
-// stay disabled.
-export const ENABLED_STAGE_KEYS: StageKey[] = ['design-space', 'recommendations']
+// Which stages a user can actually open. Recommendations only unlocks once a
+// batch has been generated; before that only the Design Space is navigable.
+export function enabledStageKeys(hasBatch: boolean): StageKey[] {
+  return hasBatch ? ['design-space', 'recommendations'] : ['design-space']
+}
 
-export function isStageEnabled(key: StageKey): boolean {
-  return ENABLED_STAGE_KEYS.includes(key)
+export function isStageEnabled(key: StageKey, hasBatch: boolean): boolean {
+  return enabledStageKeys(hasBatch).includes(key)
 }
 
 // The batch a fresh Recommendations view should show: the highest round number
@@ -145,11 +147,9 @@ export function resolveInitialStage(
   view: RunViewDto | null,
   urlStage: string | null,
 ): StageKey {
-  if (urlStage !== null && isStageEnabled(urlStage as StageKey)) {
+  const hasBatch = view !== null && view.recommendationBatches.length > 0
+  if (urlStage !== null && isStageEnabled(urlStage as StageKey, hasBatch)) {
     return urlStage as StageKey
   }
-  if (view !== null && view.recommendationBatches.length > 0) {
-    return 'recommendations'
-  }
-  return 'design-space'
+  return hasBatch ? 'recommendations' : 'design-space'
 }

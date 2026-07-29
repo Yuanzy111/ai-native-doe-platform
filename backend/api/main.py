@@ -19,6 +19,7 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from backend.adapters.baybe import BayBEAdapter
+from backend.agent.model import build_agent_model_from_env
 from backend.api.app import create_app
 
 _DEFAULT_DB_PATH = "data/doe.db"
@@ -43,8 +44,16 @@ def build_app() -> FastAPI:
 
     Intended for ``uvicorn ... --factory``: it is called once at startup and
     returns a ready-to-serve application without leaving a connection open.
+
+    The agent model is built from the environment (``AGENT_*``); when those are
+    unset it is ``None`` and the agent routes report ``AGENT_NOT_CONFIGURED``
+    while the rest of the API still serves.
     """
-    return create_app(db_path=_resolve_db_path(), adapter=BayBEAdapter())
+    return create_app(
+        db_path=_resolve_db_path(),
+        adapter=BayBEAdapter(),
+        agent_model=build_agent_model_from_env(),
+    )
 
 
 __all__ = ["build_app"]

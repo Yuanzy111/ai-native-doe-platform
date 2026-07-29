@@ -185,9 +185,15 @@ describe('buildRecommendationRows', () => {
 })
 
 describe('resolveInitialStage', () => {
-  it('honours an explicit, enabled ?stage', () => {
-    expect(resolveInitialStage(null, 'recommendations')).toBe('recommendations')
-    expect(resolveInitialStage(null, 'design-space')).toBe('design-space')
+  it('honours an explicit, enabled ?stage when a batch exists', () => {
+    const withBatch = view({ recommendationBatches: [batch()] })
+    expect(resolveInitialStage(withBatch, 'recommendations')).toBe('recommendations')
+    expect(resolveInitialStage(withBatch, 'design-space')).toBe('design-space')
+  })
+
+  it('falls back to design-space for ?stage=recommendations with no batch', () => {
+    expect(resolveInitialStage(null, 'recommendations')).toBe('design-space')
+    expect(resolveInitialStage(view(), 'recommendations')).toBe('design-space')
   })
 
   it('ignores a disabled ?stage and falls back', () => {

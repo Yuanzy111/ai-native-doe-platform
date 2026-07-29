@@ -270,6 +270,53 @@ export interface SaveDesignSpaceResponseDto {
   view: RunViewDto
 }
 
+// --- Agent (conversational design-space proposals) -------------------------
+
+export type AgentMessageRole = 'user' | 'assistant'
+
+export interface AgentMessageDto {
+  id: string
+  threadId: string
+  role: AgentMessageRole
+  content: string
+  createdAt: string
+}
+
+export type AgentProposalStatus = 'Pending' | 'Approved' | 'Rejected' | 'Failed'
+
+export type AgentProposalKind =
+  | 'designSpacePatch'
+  | 'validateDesignSpace'
+  | 'generateInitialDesign'
+
+export interface AgentProposalDto {
+  id: string
+  threadId: string
+  campaignRunId: string
+  kind: AgentProposalKind
+  // The stored action payload the backend serialized. Rendered structurally for
+  // the approval card; the frontend never executes it.
+  payload: Record<string, unknown>
+  status: AgentProposalStatus
+  baseRevisionId: string
+  createdAt: string
+  resolvedAt: string | null
+  error: string | null
+}
+
+export interface AgentThreadDto {
+  threadId: string | null
+  messages: AgentMessageDto[]
+  pendingProposals: AgentProposalDto[]
+}
+
+export interface ApproveProposalResponseDto {
+  proposal: AgentProposalDto
+  view: RunViewDto
+  // Present only when a generate-initial-design proposal was approved.
+  initialDesign: InitialDesignResponseDto | null
+}
+
 // --- Request bodies --------------------------------------------------------
 
 export type ParameterSpecInput =
