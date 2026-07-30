@@ -907,39 +907,6 @@ class SqliteRepository:
         row = self._fetch_one("agent_proposal", proposal_id)
         return AgentProposal.model_validate_json(row["data"]) if row else None
 
-    def save_agent_proposal(self, proposal: AgentProposal) -> None:
-        """Persist a proposal's resolution (status/resolvedAt/error).
-
-        The owning thread, run, and immutable creation fields never change; only
-        the lifecycle state advances from Pending.
-        """
-        self._guard_immutable(
-            "agent_proposal",
-            proposal.id,
-            {
-                "thread_id": proposal.thread_id,
-                "campaign_run_id": proposal.campaign_run_id,
-            },
-        )
-        existing = self.get_agent_proposal(proposal.id)
-        if existing is None:
-            raise PersistenceError(
-                f"No 'agent_proposal' row with id {proposal.id!r} to update."
-            )
-        self._guard_fields_unchanged(
-            existing,
-            proposal,
-            ["kind", "payload", "base_revision_id", "base_run_updated_at", "created_at"],
-        )
-        self._update(
-            "agent_proposal",
-            proposal.id,
-            {
-                "status": proposal.status,
-                "data": proposal.model_dump_json(by_alias=True),
-            },
-        )
-
     def resolve_proposal_if_pending(self, proposal: AgentProposal) -> bool:
         """Atomically resolve a proposal only if it is still Pending in the DB.
 
@@ -948,11 +915,13 @@ class SqliteRepository:
         already moved to a terminal state (Approved/Rejected/Failed) is left
         untouched and this returns ``False``. This is what guarantees a proposal
         resolves — and its business action dispatches — at most once under
-        concurrent approve/approve or approve/reject.
+        concurrent approve/approve or approve/reject. It is the *only* path that
+        advances a proposal out of Pending, so a terminal state can never be
+        overwritten.
 
-        The immutable creation fields are guarded exactly as
-        :meth:`save_agent_proposal`, so a caller cannot rewrite the payload or
-        ownership through the compare-and-set path either.
+        The owning thread/run and the immutable creation fields are guarded, so
+        a caller cannot rewrite the payload or ownership through the
+        compare-and-set path either.
 
         Returns:
             ``True`` if this call won the race and applied the update; ``False``

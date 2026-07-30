@@ -5,8 +5,9 @@ import {
   describeProposal,
   isModificationProposal,
   isProposalStale,
+  runToken,
 } from './agentState'
-import type { AgentProposalDto } from '../../../api/types'
+import type { AgentProposalDto, CampaignRunDto } from '../../../api/types'
 
 function proposal(overrides: Partial<AgentProposalDto> = {}): AgentProposalDto {
   return {
@@ -21,6 +22,30 @@ function proposal(overrides: Partial<AgentProposalDto> = {}): AgentProposalDto {
     createdAt: '2026-02-01T10:00:00Z',
     resolvedAt: null,
     error: null,
+    ...overrides,
+  }
+}
+
+function run(overrides: Partial<CampaignRunDto> = {}): CampaignRunDto {
+  return {
+    id: 'run-1',
+    campaignDefinitionId: 'cd-1',
+    definitionRevisionId: 'rev-1',
+    status: 'Draft',
+    optimizationPolicy: {
+      id: 'op-1',
+      backendName: 'baybe',
+      batchSize: 4,
+      seedPolicy: 'Fixed',
+      seedValue: 42,
+      strategyConfig: { kind: 'Botorch', acquisitionFunction: 'qLogEI' },
+    } as CampaignRunDto['optimizationPolicy'],
+    round: 0,
+    budgetTotal: 10,
+    budgetUsed: 0,
+    createdAt: '2026-02-01T09:00:00Z',
+    updatedAt: 'ts-1',
+    createdBy: 'user-1',
     ...overrides,
   }
 }
@@ -185,5 +210,47 @@ describe('describeProposal', () => {
     expect(
       describeProposal(proposal({ kind: 'generateInitialDesign', payload: { kind: 'generateInitialDesign' } })).title,
     ).toBe('Generate initial design')
+  })
+})
+
+describe('runToken (validate/generate sync)', () => {
+  it('reads both halves of the token from a fresh run DTO', () => {
+    const token = runToken(run({ definitionRevisionId: 'rev-9', updatedAt: 'ts-9' }))
+    expect(token).toEqual({ currentRevisionId: 'rev-9', currentRunUpdatedAt: 'ts-9' })
+  })
+
+  it('a proposal minted after a manual validate is not judged stale', () => {
+    // A manual validate bumps updatedAt (Draft -> DesignSpaceValidated) without
+    // changing the pinned revision. Syncing from the validate response's run and
+    // pinning a new proposal to that same token must leave it fresh.
+    const validated = run({ status: 'DesignSpaceValidated', updatedAt: 'ts-2' })
+    const token = runToken(validated)
+    const fresh = proposal({ baseRevisionId: 'rev-1', baseRunUpdatedAt: 'ts-2' })
+    expect(isProposalStale(fresh, token.currentRevisionId, token.currentRunUpdatedAt)).toBe(false)
+    expect(
+      canApproveProposal({
+        proposal: fresh,
+        frozen: false,
+        dirty: false,
+        currentRevisionId: token.currentRevisionId,
+        currentRunUpdatedAt: token.currentRunUpdatedAt,
+      }),
+    ).toBe(true)
+  })
+
+  it('syncs the bumped token even when validation failed', () => {
+    // A failing validation still records an outcome and bumps updatedAt. If the
+    // frontend skipped the sync on failure, a proposal pinned to the new token
+    // (ts-3) would be wrongly judged stale against the old one (ts-1).
+    const failed = run({ status: 'Draft', updatedAt: 'ts-3' })
+    const token = runToken(failed)
+    expect(token.currentRunUpdatedAt).toBe('ts-3')
+    const pinnedToBumped = proposal({ baseRevisionId: 'rev-1', baseRunUpdatedAt: 'ts-3' })
+    expect(
+      isProposalStale(pinnedToBumped, token.currentRevisionId, token.currentRunUpdatedAt),
+    ).toBe(false)
+    // The pre-validate token (ts-1) would have made it look stale — proving the
+    // sync is load-bearing.
+    expect(isProposalStale(pinnedToBumped, 'rev-1', 'ts-1')).toBe(true)
   })
 })

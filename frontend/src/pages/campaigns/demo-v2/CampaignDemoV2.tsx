@@ -42,7 +42,7 @@ import {
   postAgentMessage,
   rejectProposal,
 } from '../../../api/agent'
-import { canApproveProposal, canSendMessage } from './agentState'
+import { canApproveProposal, canSendMessage, runToken } from './agentState'
 import type {
   AgentMessageDto,
   AgentProposalDto,
@@ -158,6 +158,27 @@ export default function CampaignDemoV2() {
     setRecommendations(selectRecommendationsData(view))
     setDirty(false)
     setBlockingIssues([])
+  }
+
+  // Sync every field that identifies the run's current version from a fresh
+  // CampaignRunDto: the lifecycle status, the concurrency token (updatedAt), the
+  // pinned revision, and the header meta (round/budget/policy). Both validate and
+  // generate return a full run and *every* one of those responses bumps
+  // updatedAt — a failing validation records an outcome and still bumps it — so
+  // going through one helper keeps the agent's stale check honest and stops any
+  // future handler from silently forgetting a field.
+  const applyCampaignRunState = (run: RunViewDto['campaignRun']) => {
+    const token = runToken(run)
+    setServerStatus(run.status)
+    setCurrentRunUpdatedAt(token.currentRunUpdatedAt)
+    setCurrentRevisionId(token.currentRevisionId)
+    setMeta((current) => ({
+      ...current,
+      round: run.round,
+      budgetUsed: run.budgetUsed,
+      budgetTotal: run.budgetTotal,
+      batchSize: run.optimizationPolicy.batchSize,
+    }))
   }
 
   const applyThread = (messages: AgentMessageDto[], pending: AgentProposalDto[]) => {
@@ -410,14 +431,10 @@ export default function CampaignDemoV2() {
     setValidating(true)
     try {
       const result = await validateDesignSpace(targetRunId)
-      setServerStatus(result.campaignRun.status)
-      setMeta((current) => ({
-        ...current,
-        round: result.campaignRun.round,
-        budgetUsed: result.campaignRun.budgetUsed,
-        budgetTotal: result.campaignRun.budgetTotal,
-        batchSize: result.campaignRun.optimizationPolicy.batchSize,
-      }))
+      // Sync the run token whether validation passed or failed: the server
+      // records the outcome either way, bumping updatedAt. Skipping this on
+      // failure would leave an agent proposal minted next wrongly judged stale.
+      applyCampaignRunState(result.campaignRun)
       const blocking = result.validationResult.issues.filter(
         (issue) => issue.severity === 'blocking',
       )
@@ -445,14 +462,7 @@ export default function CampaignDemoV2() {
     setGenerating(true)
     try {
       const response = await generateInitialDesign(runId)
-      setServerStatus(response.campaignRun.status)
-      setMeta((current) => ({
-        ...current,
-        round: response.campaignRun.round,
-        budgetUsed: response.campaignRun.budgetUsed,
-        budgetTotal: response.campaignRun.budgetTotal,
-        batchSize: response.campaignRun.optimizationPolicy.batchSize,
-      }))
+      applyCampaignRunState(response.campaignRun)
       setRecommendations({
         batch: response.recommendationBatch,
         round: response.experimentRound,

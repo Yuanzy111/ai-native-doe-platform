@@ -6,7 +6,25 @@
 // (see backend/agent/contract.py): an action keyed on `kind`, and for a design
 // space patch a single op keyed on `op`.
 
-import type { AgentProposalDto } from '../../../api/types'
+import type { AgentProposalDto, CampaignRunDto } from '../../../api/types'
+
+// The pair the stale check compares a proposal's pin against, read from a single
+// fresh run DTO. Every response that mutates a run (create/save/validate/
+// generate/approve) carries a full CampaignRunDto, and each bumps updatedAt — a
+// failing validation records its outcome and still bumps it. Extracting both
+// halves from one place keeps the frontend's token in lockstep with the backend
+// and stops a handler from syncing one field while forgetting the other.
+export interface RunToken {
+  currentRevisionId: string
+  currentRunUpdatedAt: string
+}
+
+export function runToken(run: CampaignRunDto): RunToken {
+  return {
+    currentRevisionId: run.definitionRevisionId,
+    currentRunUpdatedAt: run.updatedAt,
+  }
+}
 
 // A message is sendable only when it has non-whitespace content and no request
 // is already in flight. This blocks empty sends and duplicate concurrent sends,

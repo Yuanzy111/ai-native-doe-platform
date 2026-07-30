@@ -14,6 +14,11 @@ from datetime import datetime, timezone
 
 import pytest
 
+from backend.adapters.errors import (
+    AdapterComputationError,
+    AdapterError,
+    UnsupportedFeatureError,
+)
 from backend.agent.errors import (
     AgentActionRejectedError,
     AgentInvalidActionError,
@@ -294,6 +299,90 @@ def test_approval_failure_rolls_back_and_marks_failed(
 
     # Campaign is untouched and the proposal is Failed, never Pending-with-mutation.
     assert _param_count(seeded_run) == 2
+    proposal = seeded_run.get_agent_proposal(proposal_id)
+    assert proposal.status is AgentProposalStatus.FAILED
+    assert proposal.error
+
+
+# §7 — an optimizer-boundary failure also rolls back and marks Failed ----------
+
+
+class _RaisingAdapter:
+    """An :class:`OptimizerAdapter` whose generate leg always raises.
+
+    The message embeds a sentinel so a test can assert it never leaks into the
+    proposal's stored error or the surfaced result.
+    """
+
+    SECRET = "internal-backend-secret-do-not-leak"
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+        self.calls = 0
+
+    def generate_initial_design(self, revision, policy):  # noqa: ANN001
+        self.calls += 1
+        raise self._error
+
+
+def _generate_proposal_id(agent, fake_agent_model):
+    """Stage and return a Pending generate proposal on a validated run."""
+    fake_agent_model.queue(_turn("Generating the initial design.", _GENERATE))
+    return agent.post_message(_RUN_ID, _ACTOR, "Generate")["pendingProposals"][0]["id"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        AdapterComputationError(_RaisingAdapter.SECRET),
+        UnsupportedFeatureError(_RaisingAdapter.SECRET),
+    ],
+    ids=["computation", "unsupported"],
+)
+def test_generate_adapter_error_marks_failed_and_rolls_back(
+    seeded_run, fake_agent_model, error
+):
+    adapter = _RaisingAdapter(error)
+    application = ApplicationService(seeded_run, adapter=adapter)
+    agent = AgentService(
+        seeded_run, fake_agent_model, application, RunQueryService(seeded_run)
+    )
+    application.validate_design_space(_RUN_ID, _ACTOR)
+    proposal_id = _generate_proposal_id(agent, fake_agent_model)
+
+    with pytest.raises(AdapterError):
+        agent.approve_proposal(_RUN_ID, proposal_id, _ACTOR)
+
+    # The adapter was reached, but the run never advanced past validation and no
+    # batch was written; the proposal is Failed, not Pending.
+    assert adapter.calls == 1
+    run = seeded_run.get_run(_RUN_ID)
+    assert run.status is RunStatus.DESIGN_SPACE_VALIDATED
+    assert seeded_run.list_batches(_RUN_ID) == []
+    proposal = seeded_run.get_agent_proposal(proposal_id)
+    assert proposal.status is AgentProposalStatus.FAILED
+    # The raw backend message (with its sentinel) must never be persisted.
+    assert proposal.error
+    assert _RaisingAdapter.SECRET not in proposal.error
+
+
+def test_generate_without_adapter_marks_failed_and_rolls_back(
+    seeded_run, fake_agent_model
+):
+    # No adapter configured: generate_initial_design raises NotImplementedError.
+    application = ApplicationService(seeded_run)
+    agent = AgentService(
+        seeded_run, fake_agent_model, application, RunQueryService(seeded_run)
+    )
+    application.validate_design_space(_RUN_ID, _ACTOR)
+    proposal_id = _generate_proposal_id(agent, fake_agent_model)
+
+    with pytest.raises(NotImplementedError):
+        agent.approve_proposal(_RUN_ID, proposal_id, _ACTOR)
+
+    run = seeded_run.get_run(_RUN_ID)
+    assert run.status is RunStatus.DESIGN_SPACE_VALIDATED
+    assert seeded_run.list_batches(_RUN_ID) == []
     proposal = seeded_run.get_agent_proposal(proposal_id)
     assert proposal.status is AgentProposalStatus.FAILED
     assert proposal.error

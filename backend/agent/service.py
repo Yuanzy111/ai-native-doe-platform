@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import TypeAdapter, ValidationError
 
+from backend.adapters.errors import AdapterError
 from backend.agent.contract import (
     AgentAction,
     AgentTurn,
@@ -335,11 +336,20 @@ class AgentService:
             ServiceError,
             StateTransitionError,
             AgentInvalidActionError,
+            AdapterError,
+            NotImplementedError,
         ) as exc:
-            # The outer transaction rolled the campaign change back; record the
-            # failure on the proposal in a *separate* transaction, and only if it
-            # is still Pending — never clobbering a terminal state.
-            self._fail_if_pending(run_id, proposal_id, str(exc))
+            # The dispatch failed after the outer transaction rolled the campaign
+            # change back: a service/state error, an optimizer-boundary failure
+            # (AdapterError — a legitimate refusal such as an unsupported feature,
+            # or a backend computation failure), or a missing adapter
+            # (NotImplementedError). Record the failure on the proposal in a
+            # *separate* transaction, and only if it is still Pending — never
+            # clobbering a terminal state. Note StaleAgentProposalError and the
+            # plain state-gate AgentActionRejectedError are deliberately NOT
+            # caught here: those raise before any dispatch, leaving the proposal
+            # Pending so the user can still reject it.
+            self._fail_if_pending(run_id, proposal_id, self._failure_reason(exc))
             raise
 
         return {
@@ -530,6 +540,22 @@ class AgentService:
         return proposal.model_copy(
             update={"status": status, "resolved_at": _now(), "error": error}
         )
+
+    @staticmethod
+    def _failure_reason(exc: Exception) -> str:
+        """A stable, leak-free reason to store on a Failed proposal.
+
+        A raw optimizer-boundary message (``AdapterError``) may carry backend
+        internals, and a missing-adapter ``NotImplementedError`` is a deployment
+        detail — neither should be persisted or shown. Both are collapsed to a
+        fixed sentence; our own service/state errors already carry controlled,
+        user-facing text and pass through unchanged.
+        """
+        if isinstance(exc, AdapterError):
+            return "The optimization backend could not fulfill the request."
+        if isinstance(exc, NotImplementedError):
+            return "The optimization backend is not available."
+        return str(exc)
 
     def _fail_if_pending(self, run_id: str, proposal_id: str, error: str) -> None:
         """Mark a proposal Failed, but only if it is still Pending.
