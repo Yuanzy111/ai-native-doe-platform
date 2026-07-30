@@ -5,6 +5,7 @@ import {
   canSendMessage,
   describeProposal,
   isProposalStale,
+  type DesignSpaceSnapshot,
 } from '../agentState'
 
 interface Props {
@@ -26,6 +27,9 @@ interface Props {
   // The run's current version token (its updatedAt, null before first save). A
   // proposal pinned to a different token is stale even if the revision matches.
   currentRunUpdatedAt: string | null
+  // The current design space, so an update proposal renders a field-level
+  // "old → new" diff against what is on screen rather than only the new values.
+  designSpace: DesignSpaceSnapshot
   errorMessage: string | null
   onDraftChange: (value: string) => void
   onSend: () => void
@@ -39,6 +43,7 @@ function ProposalCard({
   dirty,
   currentRevisionId,
   currentRunUpdatedAt,
+  designSpace,
   actioning,
   onApprove,
   onReject,
@@ -48,11 +53,12 @@ function ProposalCard({
   dirty: boolean
   currentRevisionId: string | null
   currentRunUpdatedAt: string | null
+  designSpace: DesignSpaceSnapshot
   actioning: boolean
   onApprove: (proposalId: string) => void
   onReject: (proposalId: string) => void
 }) {
-  const summary = describeProposal(proposal)
+  const summary = describeProposal(proposal, designSpace)
   // The disable decision is the single source of truth in `canApproveProposal`;
   // the individual predicates below only pick which hint to show.
   const stale = isProposalStale(proposal, currentRevisionId, currentRunUpdatedAt)
@@ -135,6 +141,7 @@ export default function AgentPanel({
   dirty,
   currentRevisionId,
   currentRunUpdatedAt,
+  designSpace,
   errorMessage,
   onDraftChange,
   onSend,
@@ -206,6 +213,7 @@ export default function AgentPanel({
                 dirty={dirty}
                 currentRevisionId={currentRevisionId}
                 currentRunUpdatedAt={currentRunUpdatedAt}
+                designSpace={designSpace}
                 actioning={actioningProposalId === proposal.id}
                 onApprove={onApprove}
                 onReject={onReject}

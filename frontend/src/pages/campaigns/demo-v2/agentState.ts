@@ -7,6 +7,7 @@
 // space patch a single op keyed on `op`.
 
 import type { AgentProposalDto, CampaignRunDto } from '../../../api/types'
+import type { Objective, Parameter } from './types'
 
 // The pair the stale check compares a proposal's pin against, read from a single
 // fresh run DTO. Every response that mutates a run (create/save/validate/
@@ -80,6 +81,58 @@ export interface ProposalSummary {
   lines: string[]
 }
 
+// The current design space, passed so an update op can render a field-level
+// "old → new" diff instead of only the proposed new values. Optional: without
+// it (or when the target id is not found) the card falls back to showing just
+// the new values, which is all an add/delete op needs.
+export interface DesignSpaceSnapshot {
+  parameters: Parameter[]
+  objectives: Objective[]
+}
+
+// Render a single field as "old → new" when it changed, or just the value when
+// it is unchanged or has no prior value to compare against.
+function diffLine(label: string, before: string | null, after: string): string {
+  if (before === null || before === after) return `${label}: ${after}`
+  return `${label}: ${before} → ${after}`
+}
+
+function parameterBefore(param: Parameter): Record<string, string> {
+  const fields: Record<string, string> = {
+    Name: `${param.name} (${param.type})`,
+  }
+  if (param.unit) fields.Unit = param.unit
+  if (param.type === 'Continuous') {
+    fields.Range = `${param.lowerBound} – ${param.upperBound}`
+  } else {
+    fields.Values = param.values.join(', ')
+  }
+  return fields
+}
+
+function objectiveBefore(objective: Objective): Record<string, string> {
+  const fields: Record<string, string> = {
+    Objective: objective.name,
+    Direction: objective.direction,
+  }
+  if (objective.unit) fields.Unit = objective.unit
+  return fields
+}
+
+// Merge the "before" field map into the "after" lines produced from the patch,
+// turning any changed field into an "old → new" line. Fields present only in
+// the new value (e.g. a unit that was previously blank) still render as a plain
+// new value via diffLine's null-before fallback.
+function diffLines(before: Record<string, string>, afterLines: string[]): string[] {
+  return afterLines.map((line) => {
+    const separator = line.indexOf(': ')
+    if (separator === -1) return line
+    const label = line.slice(0, separator)
+    const after = line.slice(separator + 2)
+    return diffLine(label, before[label] ?? null, after)
+  })
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object'
     ? (value as Record<string, unknown>)
@@ -120,25 +173,36 @@ function objectiveLines(objective: Record<string, unknown>): string[] {
   return lines
 }
 
-function patchSummary(patch: Record<string, unknown>): ProposalSummary {
+function patchSummary(
+  patch: Record<string, unknown>,
+  snapshot?: DesignSpaceSnapshot,
+): ProposalSummary {
   const op = asText(patch.op)
   switch (op) {
     case 'addParameter':
       return { title: 'Add parameter', lines: parameterLines(asRecord(patch.parameter)) }
-    case 'updateParameter':
-      return {
-        title: 'Update parameter',
-        lines: [`Id: ${asText(patch.id) ?? '(missing)'}`, ...parameterLines(asRecord(patch.parameter))],
-      }
+    case 'updateParameter': {
+      const id = asText(patch.id)
+      const newLines = parameterLines(asRecord(patch.parameter))
+      const current = snapshot?.parameters.find((param) => param.id === id) ?? null
+      const lines = current
+        ? diffLines(parameterBefore(current), newLines)
+        : newLines
+      return { title: 'Update parameter', lines: [`Id: ${id ?? '(missing)'}`, ...lines] }
+    }
     case 'deleteParameter':
       return { title: 'Delete parameter', lines: [`Id: ${asText(patch.id) ?? '(missing)'}`] }
     case 'addObjective':
       return { title: 'Add objective', lines: objectiveLines(asRecord(patch.objective)) }
-    case 'updateObjective':
-      return {
-        title: 'Update objective',
-        lines: [`Id: ${asText(patch.id) ?? '(missing)'}`, ...objectiveLines(asRecord(patch.objective))],
-      }
+    case 'updateObjective': {
+      const id = asText(patch.id)
+      const newLines = objectiveLines(asRecord(patch.objective))
+      const current = snapshot?.objectives.find((obj) => obj.targetId === id) ?? null
+      const lines = current
+        ? diffLines(objectiveBefore(current), newLines)
+        : newLines
+      return { title: 'Update objective', lines: [`Id: ${id ?? '(missing)'}`, ...lines] }
+    }
     case 'deleteObjective':
       return { title: 'Delete objective', lines: [`Id: ${asText(patch.id) ?? '(missing)'}`] }
     case 'setNoConstraint':
@@ -155,10 +219,16 @@ function patchSummary(patch: Record<string, unknown>): ProposalSummary {
   }
 }
 
-export function describeProposal(proposal: AgentProposalDto): ProposalSummary {
+export function describeProposal(
+  proposal: AgentProposalDto,
+  snapshot?: DesignSpaceSnapshot,
+): ProposalSummary {
   switch (proposal.kind) {
     case 'designSpacePatch':
-      return patchSummary(asRecord(proposal.payload).patch as Record<string, unknown>)
+      return patchSummary(
+        asRecord(proposal.payload).patch as Record<string, unknown>,
+        snapshot,
+      )
     case 'validateDesignSpace':
       return { title: 'Validate design space', lines: ['Run the deterministic design-space validation.'] }
     case 'generateInitialDesign':

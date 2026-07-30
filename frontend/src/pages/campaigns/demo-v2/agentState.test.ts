@@ -178,6 +178,92 @@ describe('describeProposal', () => {
     expect(summary.lines).toContain('Direction: Maximize')
   })
 
+  it('shows an old → new diff for an update-parameter patch against the current space', () => {
+    const summary = describeProposal(
+      proposal({
+        kind: 'designSpacePatch',
+        payload: {
+          kind: 'designSpacePatch',
+          patch: {
+            op: 'updateParameter',
+            id: 'p-temp',
+            parameter: { type: 'Continuous', name: 'Temperature', unit: '°C', lowerBound: 10, upperBound: 90 },
+          },
+        },
+      }),
+      {
+        parameters: [
+          {
+            id: 'p-temp',
+            name: 'Temperature',
+            unit: '°C',
+            description: '',
+            type: 'Continuous',
+            lowerBound: '20',
+            upperBound: '80',
+          },
+        ],
+        objectives: [],
+      },
+    )
+    expect(summary.title).toBe('Update parameter')
+    // The changed field renders as old → new; unchanged fields render plainly.
+    expect(summary.lines).toContain('Range: 20 – 80 → 10 – 90')
+    expect(summary.lines).toContain('Name: Temperature (Continuous)')
+  })
+
+  it('falls back to new values when the update target is not in the current space', () => {
+    const summary = describeProposal(
+      proposal({
+        kind: 'designSpacePatch',
+        payload: {
+          kind: 'designSpacePatch',
+          patch: {
+            op: 'updateParameter',
+            id: 'p-missing',
+            parameter: { type: 'Continuous', name: 'Pressure', lowerBound: 1, upperBound: 5 },
+          },
+        },
+      }),
+      { parameters: [], objectives: [] },
+    )
+    expect(summary.lines).toContain('Range: 1 – 5')
+    expect(summary.lines.some((line) => line.includes('→'))).toBe(false)
+  })
+
+  it('shows an old → new diff for an update-objective patch', () => {
+    const summary = describeProposal(
+      proposal({
+        kind: 'designSpacePatch',
+        payload: {
+          kind: 'designSpacePatch',
+          patch: {
+            op: 'updateObjective',
+            id: 't-1',
+            objective: { name: 'Yield', direction: 'Minimize' },
+          },
+        },
+      }),
+      {
+        parameters: [],
+        objectives: [
+          {
+            id: 'o-1',
+            outputId: 'out-1',
+            targetId: 't-1',
+            name: 'Yield',
+            direction: 'Maximize',
+            unit: '',
+            description: '',
+          },
+        ],
+      },
+    )
+    expect(summary.title).toBe('Update objective')
+    expect(summary.lines).toContain('Direction: Maximize → Minimize')
+    expect(summary.lines).toContain('Objective: Yield')
+  })
+
   it('describes a delete-parameter patch by id', () => {
     const summary = describeProposal(
       proposal({
