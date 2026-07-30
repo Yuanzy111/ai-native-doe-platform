@@ -65,7 +65,7 @@ _UPDATE_UNKNOWN = {
     "patch": {
         "op": "updateParameter",
         "id": "does-not-exist",
-        "parameter": {"type": "Continuous", "name": "X", "lowerBound": 0, "upperBound": 1},
+        "patch": {"name": "X"},
     },
 }
 

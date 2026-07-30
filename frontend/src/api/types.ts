@@ -307,6 +307,25 @@ export interface AgentProposalDto {
   createdAt: string
   resolvedAt: string | null
   error: string | null
+  // The backend-computed effect a design-space-patch proposal will have, built
+  // by dry-running the patch against baseRevisionId. Present only for pending
+  // designSpacePatch proposals; the frontend renders it verbatim and never
+  // recomputes a diff. A validate/generate proposal omits it.
+  effectPreview?: EffectPreviewDto
+}
+
+export interface ChangedFieldDto {
+  field: string
+  before: string | null
+  after: string | null
+}
+
+export interface EffectPreviewDto {
+  entityType: 'parameter' | 'objective' | 'constraint'
+  entityId: string | null
+  operation: 'add' | 'update' | 'delete' | 'set'
+  entityName: string | null
+  changedFields: ChangedFieldDto[]
 }
 
 export interface AgentThreadDto {

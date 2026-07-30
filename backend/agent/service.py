@@ -38,7 +38,7 @@ from backend.agent.errors import (
     StaleAgentProposalError,
 )
 from backend.agent.model import AgentModel
-from backend.agent.patch import apply_patch
+from backend.agent.patch import apply_patch, build_effect_preview
 from backend.agent.prompts import SYSTEM_PROMPT, build_context_message
 from backend.application import (
     ApplicationService,
@@ -142,10 +142,31 @@ class AgentService:
                 for message in self._repo.list_agent_messages(thread.id)
             ],
             "pendingProposals": [
-                _dump(proposal)
+                self._proposal_view(proposal)
                 for proposal in self._repo.list_pending_proposals(run_id)
             ],
         }
+
+    def _proposal_view(self, proposal: AgentProposal) -> dict[str, Any]:
+        """Serialize a proposal and attach a fresh ``effectPreview`` for a patch.
+
+        The preview is (re)computed by dry-running the stored patch against the
+        proposal's pinned ``base_revision_id`` — the same revision approval will
+        apply against — so it reflects the final persisted values, never
+        frontend state. A validate/generate proposal carries no preview. If the
+        base revision has since vanished the preview is simply omitted (the
+        proposal will read as stale and cannot be approved anyway).
+        """
+        view = _dump(proposal)
+        if proposal.kind != "designSpacePatch":
+            return view
+        revision = self._repo.get_revision(proposal.base_revision_id)
+        if revision is None:
+            return view
+        action = _ACTION_ADAPTER.validate_python(dict(proposal.payload))
+        if isinstance(action, DesignSpacePatchAction):
+            view["effectPreview"] = build_effect_preview(revision, action.patch)
+        return view
 
     # Conversation ----------------------------------------------------------
 

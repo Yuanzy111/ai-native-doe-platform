@@ -1,12 +1,6 @@
 import { useEffect, useRef } from 'react'
 import type { AgentMessageDto, AgentProposalDto } from '../../../../api/types'
-import {
-  canApproveProposal,
-  canSendMessage,
-  describeProposal,
-  isProposalStale,
-  type DesignSpaceSnapshot,
-} from '../agentState'
+import { canApproveProposal, canSendMessage, describeProposal, isProposalStale } from '../agentState'
 
 interface Props {
   experimentSummary: string
@@ -27,9 +21,6 @@ interface Props {
   // The run's current version token (its updatedAt, null before first save). A
   // proposal pinned to a different token is stale even if the revision matches.
   currentRunUpdatedAt: string | null
-  // The current design space, so an update proposal renders a field-level
-  // "old → new" diff against what is on screen rather than only the new values.
-  designSpace: DesignSpaceSnapshot
   errorMessage: string | null
   onDraftChange: (value: string) => void
   onSend: () => void
@@ -43,7 +34,6 @@ function ProposalCard({
   dirty,
   currentRevisionId,
   currentRunUpdatedAt,
-  designSpace,
   actioning,
   onApprove,
   onReject,
@@ -53,12 +43,11 @@ function ProposalCard({
   dirty: boolean
   currentRevisionId: string | null
   currentRunUpdatedAt: string | null
-  designSpace: DesignSpaceSnapshot
   actioning: boolean
   onApprove: (proposalId: string) => void
   onReject: (proposalId: string) => void
 }) {
-  const summary = describeProposal(proposal, designSpace)
+  const summary = describeProposal(proposal)
   // The disable decision is the single source of truth in `canApproveProposal`;
   // the individual predicates below only pick which hint to show.
   const stale = isProposalStale(proposal, currentRevisionId, currentRunUpdatedAt)
@@ -115,7 +104,7 @@ function ProposalCard({
           onClick={() => onApprove(proposal.id)}
           className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          Approve
+          Run
         </button>
         <button
           type="button"
@@ -123,7 +112,7 @@ function ProposalCard({
           onClick={() => onReject(proposal.id)}
           className="rounded border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          Reject
+          Cancel
         </button>
       </div>
     </div>
@@ -141,7 +130,6 @@ export default function AgentPanel({
   dirty,
   currentRevisionId,
   currentRunUpdatedAt,
-  designSpace,
   errorMessage,
   onDraftChange,
   onSend,
@@ -213,7 +201,6 @@ export default function AgentPanel({
                 dirty={dirty}
                 currentRevisionId={currentRevisionId}
                 currentRunUpdatedAt={currentRunUpdatedAt}
-                designSpace={designSpace}
                 actioning={actioningProposalId === proposal.id}
                 onApprove={onApprove}
                 onReject={onReject}

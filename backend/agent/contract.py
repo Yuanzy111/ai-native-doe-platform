@@ -101,12 +101,34 @@ class AddParameterOp(_AgentBase):
     parameter: AgentParameterInput
 
 
+class AgentParameterPatch(_AgentBase):
+    """A *partial* parameter change: only the fields present are applied.
+
+    Unlike :data:`AgentParameterInput` (a full replacement), every field here is
+    optional. A field absent from the payload keeps the parameter's current
+    value; ``unit``/``description`` set explicitly to ``null`` clear it. The two
+    cases are told apart by :attr:`pydantic.BaseModel.model_fields_set`, so the
+    patch layer never confuses "not mentioned" with "cleared". ``type`` may be
+    changed (e.g. Continuous → Categorical), in which case the fields the new
+    type needs (``values`` / ``lowerBound``+``upperBound``) must be supplied; the
+    merged result is validated against the real domain model.
+    """
+
+    name: str | None = None
+    unit: str | None = None
+    description: str | None = None
+    type: Literal["Continuous", "Discrete", "Categorical"] | None = None
+    lower_bound: float | None = None
+    upper_bound: float | None = None
+    values: list[float] | list[str] | None = None
+
+
 class UpdateParameterOp(_AgentBase):
-    """Replace an existing parameter's fields, keyed on its current id."""
+    """Apply a partial change to an existing parameter, keyed on its current id."""
 
     op: Literal["updateParameter"] = "updateParameter"
     id: str
-    parameter: AgentParameterInput
+    patch: AgentParameterPatch
 
 
 class DeleteParameterOp(_AgentBase):
@@ -123,12 +145,26 @@ class AddObjectiveOp(_AgentBase):
     objective: AgentObjectiveInput
 
 
+class AgentObjectivePatch(_AgentBase):
+    """A *partial* objective change: only the fields present are applied.
+
+    Every field is optional; an absent field keeps the objective's current
+    value, while ``unit``/``description`` set explicitly to ``null`` clear it
+    (told apart via :attr:`pydantic.BaseModel.model_fields_set`).
+    """
+
+    name: str | None = None
+    direction: Direction | None = None
+    unit: str | None = None
+    description: str | None = None
+
+
 class UpdateObjectiveOp(_AgentBase):
-    """Replace an existing objective's fields, keyed on its current id."""
+    """Apply a partial change to an existing objective, keyed on its current id."""
 
     op: Literal["updateObjective"] = "updateObjective"
     id: str
-    objective: AgentObjectiveInput
+    patch: AgentObjectivePatch
 
 
 class DeleteObjectiveOp(_AgentBase):
@@ -205,6 +241,39 @@ AgentAction = Annotated[
 """Discriminated union of proposable actions, keyed on ``kind``."""
 
 
+# Effect preview ------------------------------------------------------------
+
+
+class ChangedField(_AgentBase):
+    """One field's before/after in an :class:`EffectPreview`.
+
+    ``before`` is ``null`` for an add (nothing existed) and ``after`` is ``null``
+    for a delete. Both are rendered strings — never raw model values — so the
+    frontend renders the preview verbatim without re-deriving business meaning.
+    An empty string is shown by the UI as ``(empty)``.
+    """
+
+    field: str
+    before: str | None
+    after: str | None
+
+
+class EffectPreview(_AgentBase):
+    """The structured, backend-computed effect a mutation proposal will have.
+
+    Built by dry-running the patch against the proposal's ``baseRevisionId`` so
+    it reflects exactly what approval will persist (final merged values, not the
+    raw op). The frontend renders this directly; it never recomputes a diff from
+    on-screen state.
+    """
+
+    entity_type: Literal["parameter", "objective", "constraint"]
+    entity_id: str | None = None
+    operation: Literal["add", "update", "delete", "set"]
+    entity_name: str | None = None
+    changed_fields: list[ChangedField] = Field(default_factory=list)
+
+
 class AgentTurn(_AgentBase):
     """One assistant turn: a non-empty message plus at most one proposed action."""
 
@@ -240,4 +309,8 @@ __all__ = [
     "AgentDiscreteParameter",
     "AgentCategoricalParameter",
     "AgentObjectiveInput",
+    "AgentParameterPatch",
+    "AgentObjectivePatch",
+    "ChangedField",
+    "EffectPreview",
 ]

@@ -144,155 +144,134 @@ describe('canApproveProposal', () => {
   })
 })
 
-describe('describeProposal', () => {
-  it('describes an add-parameter patch with its fields', () => {
+describe('describeProposal (renders the backend effectPreview verbatim)', () => {
+  it('titles an add-parameter preview and lists its name plus each field', () => {
     const summary = describeProposal(
       proposal({
         kind: 'designSpacePatch',
-        payload: {
-          kind: 'designSpacePatch',
-          patch: {
-            op: 'addParameter',
-            parameter: { type: 'Continuous', name: 'Temperature', unit: '°C', lowerBound: 20, upperBound: 80 },
-          },
+        effectPreview: {
+          entityType: 'parameter',
+          entityId: 'p-temp',
+          operation: 'add',
+          entityName: 'Temperature',
+          changedFields: [
+            { field: 'type', before: null, after: 'Continuous' },
+            { field: 'unit', before: null, after: '°C' },
+            { field: 'lowerBound', before: null, after: '20' },
+            { field: 'upperBound', before: null, after: '80' },
+          ],
         },
       }),
     )
     expect(summary.title).toBe('Add parameter')
-    expect(summary.lines).toContain('Name: Temperature (Continuous)')
-    expect(summary.lines).toContain('Range: 20 – 80')
+    expect(summary.lines).toContain('Name: Temperature')
+    expect(summary.lines).toContain('type: Continuous')
+    expect(summary.lines).toContain('unit: °C')
+    expect(summary.lines).toContain('upperBound: 80')
   })
 
-  it('describes an add-objective patch', () => {
+  it('renders an update as before → after only for the changed fields', () => {
     const summary = describeProposal(
       proposal({
         kind: 'designSpacePatch',
-        payload: {
-          kind: 'designSpacePatch',
-          patch: { op: 'addObjective', objective: { name: 'Yield', direction: 'Maximize' } },
+        effectPreview: {
+          entityType: 'parameter',
+          entityId: 'p-temp',
+          operation: 'update',
+          entityName: 'Temperature',
+          changedFields: [{ field: 'upperBound', before: '80', after: '90' }],
         },
       }),
-    )
-    expect(summary.title).toBe('Add objective')
-    expect(summary.lines).toContain('Objective: Yield')
-    expect(summary.lines).toContain('Direction: Maximize')
-  })
-
-  it('shows an old → new diff for an update-parameter patch against the current space', () => {
-    const summary = describeProposal(
-      proposal({
-        kind: 'designSpacePatch',
-        payload: {
-          kind: 'designSpacePatch',
-          patch: {
-            op: 'updateParameter',
-            id: 'p-temp',
-            parameter: { type: 'Continuous', name: 'Temperature', unit: '°C', lowerBound: 10, upperBound: 90 },
-          },
-        },
-      }),
-      {
-        parameters: [
-          {
-            id: 'p-temp',
-            name: 'Temperature',
-            unit: '°C',
-            description: '',
-            type: 'Continuous',
-            lowerBound: '20',
-            upperBound: '80',
-          },
-        ],
-        objectives: [],
-      },
     )
     expect(summary.title).toBe('Update parameter')
-    // The changed field renders as old → new; unchanged fields render plainly.
-    expect(summary.lines).toContain('Range: 20 – 80 → 10 – 90')
-    expect(summary.lines).toContain('Name: Temperature (Continuous)')
+    expect(summary.lines).toContain('Name: Temperature')
+    expect(summary.lines).toContain('upperBound: 80 → 90')
   })
 
-  it('falls back to new values when the update target is not in the current space', () => {
+  it('renders a cleared optional field as "(empty)"', () => {
     const summary = describeProposal(
       proposal({
         kind: 'designSpacePatch',
-        payload: {
-          kind: 'designSpacePatch',
-          patch: {
-            op: 'updateParameter',
-            id: 'p-missing',
-            parameter: { type: 'Continuous', name: 'Pressure', lowerBound: 1, upperBound: 5 },
-          },
+        effectPreview: {
+          entityType: 'parameter',
+          entityId: 'p-temp',
+          operation: 'update',
+          entityName: 'Temperature',
+          changedFields: [{ field: 'unit', before: '°C', after: '' }],
         },
       }),
-      { parameters: [], objectives: [] },
     )
-    expect(summary.lines).toContain('Range: 1 – 5')
-    expect(summary.lines.some((line) => line.includes('→'))).toBe(false)
+    expect(summary.lines).toContain('unit: °C → (empty)')
   })
 
-  it('shows an old → new diff for an update-objective patch', () => {
+  it('renders an objective direction change', () => {
     const summary = describeProposal(
       proposal({
         kind: 'designSpacePatch',
-        payload: {
-          kind: 'designSpacePatch',
-          patch: {
-            op: 'updateObjective',
-            id: 't-1',
-            objective: { name: 'Yield', direction: 'Minimize' },
-          },
+        effectPreview: {
+          entityType: 'objective',
+          entityId: 't-1',
+          operation: 'update',
+          entityName: 'Yield',
+          changedFields: [{ field: 'direction', before: 'Maximize', after: 'Minimize' }],
         },
       }),
-      {
-        parameters: [],
-        objectives: [
-          {
-            id: 'o-1',
-            outputId: 'out-1',
-            targetId: 't-1',
-            name: 'Yield',
-            direction: 'Maximize',
-            unit: '',
-            description: '',
-          },
-        ],
-      },
     )
     expect(summary.title).toBe('Update objective')
-    expect(summary.lines).toContain('Direction: Maximize → Minimize')
-    expect(summary.lines).toContain('Objective: Yield')
+    expect(summary.lines).toContain('Name: Yield')
+    expect(summary.lines).toContain('direction: Maximize → Minimize')
   })
 
-  it('describes a delete-parameter patch by id', () => {
+  it('renders a delete preview with the entity name and its fields, not just an id', () => {
     const summary = describeProposal(
       proposal({
         kind: 'designSpacePatch',
-        payload: { kind: 'designSpacePatch', patch: { op: 'deleteParameter', id: 'p-42' } },
+        effectPreview: {
+          entityType: 'parameter',
+          entityId: 'p-42',
+          operation: 'delete',
+          entityName: 'Pressure',
+          changedFields: [
+            { field: 'type', before: 'Continuous', after: null },
+            { field: 'lowerBound', before: '1', after: null },
+            { field: 'upperBound', before: '5', after: null },
+          ],
+        },
       }),
     )
     expect(summary.title).toBe('Delete parameter')
-    expect(summary.lines).toContain('Id: p-42')
+    expect(summary.lines).toContain('Name: Pressure')
+    expect(summary.lines).toContain('lowerBound: 1')
+    expect(summary.lines.some((line) => line.includes('→'))).toBe(false)
   })
 
-  it('describes a fixed-sum constraint patch', () => {
+  it('titles a fixed-sum constraint set operation', () => {
     const summary = describeProposal(
       proposal({
         kind: 'designSpacePatch',
-        payload: {
-          kind: 'designSpacePatch',
-          patch: { op: 'setFixedSumConstraint', parameterIds: ['p-resin', 'p-hardener'], rhs: 100 },
+        effectPreview: {
+          entityType: 'constraint',
+          entityId: null,
+          operation: 'set',
+          entityName: null,
+          changedFields: [{ field: 'fixedSum', before: null, after: 'p-resin + p-hardener = 100' }],
         },
       }),
     )
     expect(summary.title).toBe('Set constraint')
-    expect(summary.lines).toContain('Fixed sum: p-resin + p-hardener = 100')
+    expect(summary.lines).toContain('fixedSum: p-resin + p-hardener = 100')
+  })
+
+  it('degrades to a bare title when a design-space patch carries no effectPreview', () => {
+    const summary = describeProposal(proposal({ kind: 'designSpacePatch', effectPreview: undefined }))
+    expect(summary.title).toBe('Design-space change')
+    expect(summary.lines).toEqual([])
   })
 
   it('describes the validate and generate actions', () => {
-    expect(describeProposal(proposal({ kind: 'validateDesignSpace', payload: { kind: 'validateDesignSpace' } })).title).toBe(
-      'Validate design space',
-    )
+    expect(
+      describeProposal(proposal({ kind: 'validateDesignSpace', payload: { kind: 'validateDesignSpace' } })).title,
+    ).toBe('Validate design space')
     expect(
       describeProposal(proposal({ kind: 'generateInitialDesign', payload: { kind: 'generateInitialDesign' } })).title,
     ).toBe('Generate initial design')

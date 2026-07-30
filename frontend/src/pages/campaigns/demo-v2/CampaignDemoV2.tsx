@@ -701,7 +701,6 @@ export default function CampaignDemoV2() {
           dirty={dirty}
           currentRevisionId={currentRevisionId}
           currentRunUpdatedAt={currentRunUpdatedAt}
-          designSpace={{ parameters, objectives }}
           errorMessage={agentError}
           onDraftChange={setAgentDraft}
           onSend={() => void handleSendMessage()}

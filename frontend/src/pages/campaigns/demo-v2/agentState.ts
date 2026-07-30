@@ -6,8 +6,12 @@
 // (see backend/agent/contract.py): an action keyed on `kind`, and for a design
 // space patch a single op keyed on `op`.
 
-import type { AgentProposalDto, CampaignRunDto } from '../../../api/types'
-import type { Objective, Parameter } from './types'
+import type {
+  AgentProposalDto,
+  CampaignRunDto,
+  ChangedFieldDto,
+  EffectPreviewDto,
+} from '../../../api/types'
 
 // The pair the stale check compares a proposal's pin against, read from a single
 // fresh run DTO. Every response that mutates a run (create/save/validate/
@@ -81,162 +85,56 @@ export interface ProposalSummary {
   lines: string[]
 }
 
-// The current design space, passed so an update op can render a field-level
-// "old → new" diff instead of only the proposed new values. Optional: without
-// it (or when the target id is not found) the card falls back to showing just
-// the new values, which is all an add/delete op needs.
-export interface DesignSpaceSnapshot {
-  parameters: Parameter[]
-  objectives: Objective[]
+const _OPERATION_TITLES: Record<
+  EffectPreviewDto['operation'],
+  Record<EffectPreviewDto['entityType'], string>
+> = {
+  add: { parameter: 'Add parameter', objective: 'Add objective', constraint: 'Set constraint' },
+  update: { parameter: 'Update parameter', objective: 'Update objective', constraint: 'Set constraint' },
+  delete: { parameter: 'Delete parameter', objective: 'Delete objective', constraint: 'Remove constraint' },
+  set: { parameter: 'Set parameter', objective: 'Set objective', constraint: 'Set constraint' },
 }
 
-// Render a single field as "old → new" when it changed, or just the value when
-// it is unchanged or has no prior value to compare against.
-function diffLine(label: string, before: string | null, after: string): string {
-  if (before === null || before === after) return `${label}: ${after}`
-  return `${label}: ${before} → ${after}`
+// Render one backend-computed changed field as a line. An empty string means
+// the field was cleared (or, on a delete/add, is absent on one side) and is
+// shown as "(empty)". A genuine before→after change renders as "old → new"; a
+// one-sided change (add/delete) renders the single present value.
+function changedFieldLine(change: ChangedFieldDto): string {
+  const show = (value: string | null): string =>
+    value === null ? '' : value === '' ? '(empty)' : value
+  const { field, before, after } = change
+  if (before === null) return `${field}: ${show(after)}`
+  if (after === null) return `${field}: ${show(before)}`
+  if (before === after) return `${field}: ${show(after)}`
+  return `${field}: ${show(before)} → ${show(after)}`
 }
 
-function parameterBefore(param: Parameter): Record<string, string> {
-  const fields: Record<string, string> = {
-    Name: `${param.name} (${param.type})`,
-  }
-  if (param.unit) fields.Unit = param.unit
-  if (param.type === 'Continuous') {
-    fields.Range = `${param.lowerBound} – ${param.upperBound}`
-  } else {
-    fields.Values = param.values.join(', ')
-  }
-  return fields
-}
-
-function objectiveBefore(objective: Objective): Record<string, string> {
-  const fields: Record<string, string> = {
-    Objective: objective.name,
-    Direction: objective.direction,
-  }
-  if (objective.unit) fields.Unit = objective.unit
-  return fields
-}
-
-// Merge the "before" field map into the "after" lines produced from the patch,
-// turning any changed field into an "old → new" line. Fields present only in
-// the new value (e.g. a unit that was previously blank) still render as a plain
-// new value via diffLine's null-before fallback.
-function diffLines(before: Record<string, string>, afterLines: string[]): string[] {
-  return afterLines.map((line) => {
-    const separator = line.indexOf(': ')
-    if (separator === -1) return line
-    const label = line.slice(0, separator)
-    const after = line.slice(separator + 2)
-    return diffLine(label, before[label] ?? null, after)
-  })
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === 'object'
-    ? (value as Record<string, unknown>)
-    : {}
-}
-
-function asText(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() !== '' ? value : null
-}
-
-function parameterLines(parameter: Record<string, unknown>): string[] {
+// Turn the backend EffectPreview into a title + lines. The frontend renders the
+// preview verbatim and never recomputes a diff from on-screen state (§7).
+function previewSummary(preview: EffectPreviewDto): ProposalSummary {
+  const title = _OPERATION_TITLES[preview.operation][preview.entityType]
   const lines: string[] = []
-  const type = asText(parameter.type)
-  const name = asText(parameter.name)
-  lines.push(`Name: ${name ?? '(unnamed)'}${type ? ` (${type})` : ''}`)
-  const unit = asText(parameter.unit)
-  if (unit) lines.push(`Unit: ${unit}`)
-  if (type === 'Continuous') {
-    const lower = parameter.lowerBound
-    const upper = parameter.upperBound
-    if (typeof lower === 'number' && typeof upper === 'number') {
-      lines.push(`Range: ${lower} – ${upper}`)
-    }
-  } else if (Array.isArray(parameter.values)) {
-    lines.push(`Values: ${parameter.values.map(String).join(', ')}`)
-  }
-  return lines
+  if (preview.entityName) lines.push(`Name: ${preview.entityName}`)
+  for (const change of preview.changedFields) lines.push(changedFieldLine(change))
+  return { title, lines }
 }
 
-function objectiveLines(objective: Record<string, unknown>): string[] {
-  const lines: string[] = []
-  const name = asText(objective.name)
-  const direction = asText(objective.direction)
-  lines.push(`Objective: ${name ?? '(unnamed)'}`)
-  if (direction) lines.push(`Direction: ${direction}`)
-  const unit = asText(objective.unit)
-  if (unit) lines.push(`Unit: ${unit}`)
-  return lines
-}
-
-function patchSummary(
-  patch: Record<string, unknown>,
-  snapshot?: DesignSpaceSnapshot,
-): ProposalSummary {
-  const op = asText(patch.op)
-  switch (op) {
-    case 'addParameter':
-      return { title: 'Add parameter', lines: parameterLines(asRecord(patch.parameter)) }
-    case 'updateParameter': {
-      const id = asText(patch.id)
-      const newLines = parameterLines(asRecord(patch.parameter))
-      const current = snapshot?.parameters.find((param) => param.id === id) ?? null
-      const lines = current
-        ? diffLines(parameterBefore(current), newLines)
-        : newLines
-      return { title: 'Update parameter', lines: [`Id: ${id ?? '(missing)'}`, ...lines] }
-    }
-    case 'deleteParameter':
-      return { title: 'Delete parameter', lines: [`Id: ${asText(patch.id) ?? '(missing)'}`] }
-    case 'addObjective':
-      return { title: 'Add objective', lines: objectiveLines(asRecord(patch.objective)) }
-    case 'updateObjective': {
-      const id = asText(patch.id)
-      const newLines = objectiveLines(asRecord(patch.objective))
-      const current = snapshot?.objectives.find((obj) => obj.targetId === id) ?? null
-      const lines = current
-        ? diffLines(objectiveBefore(current), newLines)
-        : newLines
-      return { title: 'Update objective', lines: [`Id: ${id ?? '(missing)'}`, ...lines] }
-    }
-    case 'deleteObjective':
-      return { title: 'Delete objective', lines: [`Id: ${asText(patch.id) ?? '(missing)'}`] }
-    case 'setNoConstraint':
-      return { title: 'Set constraint', lines: ['No fixed-sum composition constraint'] }
-    case 'setFixedSumConstraint': {
-      const rhs = typeof patch.rhs === 'number' ? patch.rhs : 100
-      const ids = Array.isArray(patch.parameterIds)
-        ? patch.parameterIds.map(String).join(' + ')
-        : 'the composition parameters'
-      return { title: 'Set constraint', lines: [`Fixed sum: ${ids} = ${rhs}`] }
-    }
-    default:
-      return { title: 'Design-space change', lines: [`Unrecognized op: ${op ?? '(none)'}`] }
+export function describeProposal(proposal: AgentProposalDto): ProposalSummary {
+  if (proposal.kind === 'designSpacePatch') {
+    // A pending patch always carries a backend effectPreview; render it. Its
+    // absence (a resolved proposal, or a vanished base revision) degrades to a
+    // bare title rather than a client-side re-derivation.
+    if (proposal.effectPreview) return previewSummary(proposal.effectPreview)
+    return { title: 'Design-space change', lines: [] }
   }
-}
-
-export function describeProposal(
-  proposal: AgentProposalDto,
-  snapshot?: DesignSpaceSnapshot,
-): ProposalSummary {
-  switch (proposal.kind) {
-    case 'designSpacePatch':
-      return patchSummary(
-        asRecord(proposal.payload).patch as Record<string, unknown>,
-        snapshot,
-      )
-    case 'validateDesignSpace':
-      return { title: 'Validate design space', lines: ['Run the deterministic design-space validation.'] }
-    case 'generateInitialDesign':
-      return {
-        title: 'Generate initial design',
-        lines: ['Generate the first-round design with the optimizer.'],
-      }
-    default:
-      return { title: 'Proposal', lines: [] }
+  if (proposal.kind === 'validateDesignSpace') {
+    return { title: 'Validate design space', lines: ['Run the deterministic design-space validation.'] }
   }
+  if (proposal.kind === 'generateInitialDesign') {
+    return {
+      title: 'Generate initial design',
+      lines: ['Generate the first-round design with the optimizer.'],
+    }
+  }
+  return { title: 'Proposal', lines: [] }
 }

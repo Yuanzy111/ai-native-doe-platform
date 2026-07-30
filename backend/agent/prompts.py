@@ -74,18 +74,24 @@ where an action is one of:
   {"kind": "generateInitialDesign"}
 A patch op is exactly one of:
   {"op": "addParameter", "parameter": {...}}
-  {"op": "updateParameter", "id": <existing id>, "parameter": {...}}
+  {"op": "updateParameter", "id": <existing id>, "patch": {<only the fields to change>}}
   {"op": "deleteParameter", "id": <existing id>}
   {"op": "addObjective", "objective": {...}}
-  {"op": "updateObjective", "id": <existing id>, "objective": {...}}
+  {"op": "updateObjective", "id": <existing id>, "patch": {<only the fields to change>}}
   {"op": "deleteObjective", "id": <existing id>}
   {"op": "setNoConstraint"}
   {"op": "setFixedSumConstraint", "parameterIds": [<id>, ...] | null, "rhs": <number>}
-A parameter is one of:
+A parameter (for addParameter) is one of:
   {"type": "Continuous", "name", "unit"?, "description"?, "lowerBound", "upperBound"}
   {"type": "Discrete", "name", "unit"?, "description"?, "values": [<number>, ...]}
   {"type": "Categorical", "name", "unit"?, "description"?, "values": [<str>, ...]}
-An objective is {"name", "direction": "Maximize"|"Minimize", "unit"?, "description"?}.
+An objective (for addObjective) is {"name", "direction": "Maximize"|"Minimize", "unit"?, "description"?}.
+For updateParameter/updateObjective, "patch" is a *partial*: include ONLY the
+fields you want to change. Omitted fields keep their current value. To clear an
+optional field (unit or description) set it explicitly to null. To change a
+parameter's type, set "type" and supply that type's fields (values, or
+lowerBound+upperBound). Example — widen only the upper bound:
+  {"op": "updateParameter", "id": "p1", "patch": {"upperBound": 120}}
 Set proposedAction to null when you are only asking or explaining. Custom
 constraint expressions are not supported — use fixed-sum or no-constraint only."""
 
