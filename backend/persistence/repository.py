@@ -178,11 +178,18 @@ class SqliteRepository:
     # Transactions ----------------------------------------------------------
 
     @contextmanager
-    def transaction(self) -> Iterator["SqliteRepository"]:
+    def transaction(self, immediate: bool = False) -> Iterator["SqliteRepository"]:
         """Run a reentrant unit of work; commit on success, roll back on error.
 
         Nested calls join the outer transaction: only the outermost context
         issues ``BEGIN``/``COMMIT``/``ROLLBACK``.
+
+        Args:
+            immediate: When the *outermost* transaction, issue ``BEGIN IMMEDIATE``
+                so the write lock is taken up front. A read-then-write unit of
+                work (re-read the run/proposal, then mutate) must use this so a
+                concurrent writer cannot slip a change in between the read and the
+                write. Ignored on a nested call, which joins the outer one.
 
         Yields:
             This repository, for convenient chaining.
@@ -191,7 +198,7 @@ class SqliteRepository:
             Exception: Re-raises any exception from the body after rolling back.
         """
         if self._transaction_depth == 0:
-            self._conn.execute("BEGIN")
+            self._conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
         self._transaction_depth += 1
         try:
             yield self
@@ -922,7 +929,7 @@ class SqliteRepository:
         self._guard_fields_unchanged(
             existing,
             proposal,
-            ["kind", "payload", "base_revision_id", "created_at"],
+            ["kind", "payload", "base_revision_id", "base_run_updated_at", "created_at"],
         )
         self._update(
             "agent_proposal",
@@ -932,6 +939,54 @@ class SqliteRepository:
                 "data": proposal.model_dump_json(by_alias=True),
             },
         )
+
+    def resolve_proposal_if_pending(self, proposal: AgentProposal) -> bool:
+        """Atomically resolve a proposal only if it is still Pending in the DB.
+
+        A database-level compare-and-set: the ``UPDATE`` matches on both the id
+        and ``status = 'Pending'``, so a proposal that a concurrent request has
+        already moved to a terminal state (Approved/Rejected/Failed) is left
+        untouched and this returns ``False``. This is what guarantees a proposal
+        resolves — and its business action dispatches — at most once under
+        concurrent approve/approve or approve/reject.
+
+        The immutable creation fields are guarded exactly as
+        :meth:`save_agent_proposal`, so a caller cannot rewrite the payload or
+        ownership through the compare-and-set path either.
+
+        Returns:
+            ``True`` if this call won the race and applied the update; ``False``
+            if the proposal was no longer Pending.
+        """
+        self._guard_immutable(
+            "agent_proposal",
+            proposal.id,
+            {
+                "thread_id": proposal.thread_id,
+                "campaign_run_id": proposal.campaign_run_id,
+            },
+        )
+        existing = self.get_agent_proposal(proposal.id)
+        if existing is None:
+            raise PersistenceError(
+                f"No 'agent_proposal' row with id {proposal.id!r} to update."
+            )
+        self._guard_fields_unchanged(
+            existing,
+            proposal,
+            ["kind", "payload", "base_revision_id", "base_run_updated_at", "created_at"],
+        )
+        cursor = self._conn.execute(
+            "UPDATE agent_proposal SET status = ?, data = ? "
+            "WHERE id = ? AND status = ?",
+            (
+                proposal.status,
+                proposal.model_dump_json(by_alias=True),
+                proposal.id,
+                AgentProposalStatus.PENDING.value,
+            ),
+        )
+        return cursor.rowcount == 1
 
     def list_pending_proposals(self, run_id: str) -> list[AgentProposal]:
         """List a run's Pending proposals in insertion order."""

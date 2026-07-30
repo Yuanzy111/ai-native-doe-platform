@@ -299,6 +299,11 @@ export interface AgentProposalDto {
   payload: Record<string, unknown>
   status: AgentProposalStatus
   baseRevisionId: string
+  // The run's updatedAt when the proposal was minted. Together with
+  // baseRevisionId it forms the concurrency token: if either differs from the
+  // run's current values the proposal is stale (the run's status, policy, or
+  // revision moved) and must not be approved.
+  baseRunUpdatedAt: string
   createdAt: string
   resolvedAt: string | null
   error: string | null

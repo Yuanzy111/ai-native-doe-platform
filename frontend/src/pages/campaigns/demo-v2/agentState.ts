@@ -22,31 +22,39 @@ export function isModificationProposal(proposal: AgentProposalDto): boolean {
   return proposal.kind === 'designSpacePatch'
 }
 
-// A proposal is stale when it was minted against a revision that no longer
-// matches the run's current one — approving it would apply a patch on top of a
-// design space the user has since changed. `currentRevisionId` is null before a
-// run is persisted, in which case staleness is undecidable and we treat it as
-// stale to force a save first.
+// A proposal is stale when the run moved since it was minted — either the
+// pinned revision changed, or the run's version token (`updatedAt`, which every
+// status/policy/revision change bumps) changed. Approving a stale proposal would
+// apply it on top of a design space, policy, or lifecycle state the user has
+// since changed. Both `currentRevisionId` and `currentRunUpdatedAt` are null
+// before a run is persisted, in which case staleness is undecidable and we treat
+// it as stale to force a save first. This mirrors the backend token exactly.
 export function isProposalStale(
   proposal: AgentProposalDto,
   currentRevisionId: string | null,
+  currentRunUpdatedAt: string | null,
 ): boolean {
-  if (currentRevisionId === null) return true
-  return proposal.baseRevisionId !== currentRevisionId
+  if (currentRevisionId === null || currentRunUpdatedAt === null) return true
+  return (
+    proposal.baseRevisionId !== currentRevisionId ||
+    proposal.baseRunUpdatedAt !== currentRunUpdatedAt
+  )
 }
 
 // Approval is allowed only when nothing would silently clobber the user's work:
-// the design space must be neither frozen nor dirty (unsaved local edits), and
-// the proposal must be pinned to the current revision.
+// the run must be neither frozen (all proposals blocked, not just modifications)
+// nor dirty (unsaved local edits), and the proposal must be pinned to the run's
+// current revision *and* version token.
 export function canApproveProposal(params: {
   proposal: AgentProposalDto
   frozen: boolean
   dirty: boolean
   currentRevisionId: string | null
+  currentRunUpdatedAt: string | null
 }): boolean {
-  const { proposal, frozen, dirty, currentRevisionId } = params
+  const { proposal, frozen, dirty, currentRevisionId, currentRunUpdatedAt } = params
   if (frozen || dirty) return false
-  return !isProposalStale(proposal, currentRevisionId)
+  return !isProposalStale(proposal, currentRevisionId, currentRunUpdatedAt)
 }
 
 export interface ProposalSummary {

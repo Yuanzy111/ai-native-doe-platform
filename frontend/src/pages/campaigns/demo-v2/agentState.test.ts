@@ -17,6 +17,7 @@ function proposal(overrides: Partial<AgentProposalDto> = {}): AgentProposalDto {
     payload: {},
     status: 'Pending',
     baseRevisionId: 'rev-1',
+    baseRunUpdatedAt: 'ts-1',
     createdAt: '2026-02-01T10:00:00Z',
     resolvedAt: null,
     error: null,
@@ -48,21 +49,50 @@ describe('isModificationProposal', () => {
 })
 
 describe('isProposalStale', () => {
-  it('is fresh when the base revision matches the current one', () => {
-    expect(isProposalStale(proposal({ baseRevisionId: 'rev-1' }), 'rev-1')).toBe(false)
+  it('is fresh when both the revision and run token match', () => {
+    expect(
+      isProposalStale(
+        proposal({ baseRevisionId: 'rev-1', baseRunUpdatedAt: 'ts-1' }),
+        'rev-1',
+        'ts-1',
+      ),
+    ).toBe(false)
   })
 
   it('is stale when the current revision has moved on', () => {
-    expect(isProposalStale(proposal({ baseRevisionId: 'rev-1' }), 'rev-2')).toBe(true)
+    expect(
+      isProposalStale(
+        proposal({ baseRevisionId: 'rev-1', baseRunUpdatedAt: 'ts-1' }),
+        'rev-2',
+        'ts-1',
+      ),
+    ).toBe(true)
+  })
+
+  it('is stale when the run token moved even though the revision matches', () => {
+    // A status transition or policy swap bumps updatedAt without changing the
+    // pinned revision id; the run token catches it.
+    expect(
+      isProposalStale(
+        proposal({ baseRevisionId: 'rev-1', baseRunUpdatedAt: 'ts-1' }),
+        'rev-1',
+        'ts-2',
+      ),
+    ).toBe(true)
   })
 
   it('is stale (undecidable) before the run is persisted', () => {
-    expect(isProposalStale(proposal({ baseRevisionId: 'rev-1' }), null)).toBe(true)
+    expect(isProposalStale(proposal({ baseRevisionId: 'rev-1' }), null, 'ts-1')).toBe(true)
+    expect(isProposalStale(proposal({ baseRevisionId: 'rev-1' }), 'rev-1', null)).toBe(true)
   })
 })
 
 describe('canApproveProposal', () => {
-  const base = { proposal: proposal({ baseRevisionId: 'rev-1' }), currentRevisionId: 'rev-1' }
+  const base = {
+    proposal: proposal({ baseRevisionId: 'rev-1', baseRunUpdatedAt: 'ts-1' }),
+    currentRevisionId: 'rev-1',
+    currentRunUpdatedAt: 'ts-1',
+  }
 
   it('allows approval of a fresh proposal on a clean, unfrozen design space', () => {
     expect(canApproveProposal({ ...base, frozen: false, dirty: false })).toBe(true)
@@ -72,18 +102,19 @@ describe('canApproveProposal', () => {
     expect(canApproveProposal({ ...base, frozen: false, dirty: true })).toBe(false)
   })
 
-  it('blocks approval while the design space is frozen', () => {
+  it('blocks approval while the run is frozen', () => {
     expect(canApproveProposal({ ...base, frozen: true, dirty: false })).toBe(false)
   })
 
-  it('blocks approval of a stale proposal', () => {
+  it('blocks approval of a proposal stale by revision', () => {
     expect(
-      canApproveProposal({
-        proposal: proposal({ baseRevisionId: 'rev-1' }),
-        currentRevisionId: 'rev-2',
-        frozen: false,
-        dirty: false,
-      }),
+      canApproveProposal({ ...base, currentRevisionId: 'rev-2', frozen: false, dirty: false }),
+    ).toBe(false)
+  })
+
+  it('blocks approval of a proposal stale by run token', () => {
+    expect(
+      canApproveProposal({ ...base, currentRunUpdatedAt: 'ts-2', frozen: false, dirty: false }),
     ).toBe(false)
   })
 })

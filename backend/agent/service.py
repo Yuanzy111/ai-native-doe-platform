@@ -79,6 +79,24 @@ def _new_id() -> str:
     return str(uuid.uuid4())
 
 
+def _run_token(run: CampaignRun) -> tuple[str, str, str, datetime]:
+    """A concurrency token capturing a run's full mutable version.
+
+    Binds the three things a proposal is pinned to (§1): the pinned
+    ``definitionRevisionId``, the lifecycle ``status``, and the
+    ``OptimizationPolicy`` identity — plus ``updatedAt``, which every run
+    mutation bumps. Comparing the whole tuple detects that the run moved during a
+    slow model call (a re-pin, a status transition, or a policy swap) even when
+    one field alone looks unchanged.
+    """
+    return (
+        run.definition_revision_id,
+        run.status.value,
+        run.optimization_policy.id,
+        run.updated_at,
+    )
+
+
 class AgentService:
     """Coordinates the conversational, propose-then-approve agent workflow."""
 
@@ -162,6 +180,7 @@ class AgentService:
 
         run = self._query.require_run(run_id)
         revision = self._require_revision(run)
+        pre_token = _run_token(run)
 
         # Build the model input from persisted history plus the new user message,
         # held only in memory; nothing is written yet.
@@ -190,19 +209,27 @@ class AgentService:
         raw = self._model.generate(system, history)
         turn = self._parse_turn(raw)
 
-        # Validate any proposed action before writing anything (§4/§6).
-        if turn.proposed_action is not None:
-            self._validate_action(run, revision, turn.proposed_action)
+        # Take the write lock up front (§2): re-read the run and revision inside
+        # the transaction and compare the full token against the pre-call
+        # snapshot. If the run moved under us — a re-pin, a status transition, or
+        # a policy swap — nothing is written; the transaction rolls back with no
+        # thread, message, or proposal persisted.
+        with self._repo.transaction(immediate=True):
+            fresh_run = self._query.require_run(run_id)
+            fresh_revision = self._require_revision(fresh_run)
+            if _run_token(fresh_run) != pre_token:
+                raise StaleAgentProposalError(
+                    "The campaign was edited while the agent was responding; "
+                    "re-send the message to work against the current design space."
+                )
 
-        # Confirm the design space did not move under us during the model call.
-        fresh_run = self._query.require_run(run_id)
-        if fresh_run.definition_revision_id != run.definition_revision_id:
-            raise StaleAgentProposalError(
-                "The campaign was edited while the agent was responding; "
-                "re-send the message to work against the current design space."
-            )
+            # Validate any proposed action against the freshly re-read run before
+            # writing anything (§4/§6); a raise here rolls the empty tx back.
+            if turn.proposed_action is not None:
+                self._validate_action(
+                    fresh_run, fresh_revision, turn.proposed_action
+                )
 
-        with self._repo.transaction():
             thread = self._ensure_thread(run_id)
             self._repo.add_agent_message(
                 AgentMessage(
@@ -227,11 +254,12 @@ class AgentService:
                     AgentProposal(
                         id=_new_id(),
                         thread_id=thread.id,
-                        campaign_run_id=run.id,
+                        campaign_run_id=fresh_run.id,
                         kind=turn.proposed_action.kind,
                         payload=turn.proposed_action.model_dump(by_alias=True),
                         status=AgentProposalStatus.PENDING,
-                        base_revision_id=run.definition_revision_id,
+                        base_revision_id=fresh_run.definition_revision_id,
+                        base_run_updated_at=fresh_run.updated_at,
                         created_at=_now(),
                     )
                 )
@@ -262,35 +290,56 @@ class AgentService:
             StaleAgentProposalError: If the campaign changed since the proposal
                 was created (its pinned revision no longer matches the run).
         """
-        proposal = self._require_proposal(run_id, proposal_id)
-        if proposal.status is not AgentProposalStatus.PENDING:
-            raise AgentActionRejectedError(
-                f"Proposal {proposal_id!r} is {proposal.status.value}, not Pending."
-            )
-        run = self._query.require_run(run_id)
-        if proposal.base_revision_id != run.definition_revision_id:
-            raise StaleAgentProposalError(
-                "The campaign was edited after this proposal was created; "
-                "re-run the agent to propose against the current design space."
-            )
-        action = _ACTION_ADAPTER.validate_python(dict(proposal.payload))
-        # Re-check state gates against the live run; on failure the proposal is
-        # left Pending (nothing written) so the user can still reject it.
-        self._reject_illegal_action(run, action)
-
+        self._require_proposal(run_id, proposal_id)  # 404 before taking the lock
+        initial_design: dict[str, Any] | None = None
+        validation_result: dict[str, Any] | None = None
         try:
-            with self._repo.transaction():
+            # Take the write lock up front and re-read both the proposal and the
+            # run *inside* the transaction (§3): the Pending, staleness, and
+            # state-gate checks — and the dispatch itself — all run against the
+            # freshly re-read run, never a copy read before the lock. A concurrent
+            # writer therefore cannot slip a change in between the check and the
+            # dispatch.
+            with self._repo.transaction(immediate=True):
+                proposal = self._require_proposal(run_id, proposal_id)
+                if proposal.status is not AgentProposalStatus.PENDING:
+                    raise AgentActionRejectedError(
+                        f"Proposal {proposal_id!r} is {proposal.status.value}, "
+                        "not Pending."
+                    )
+                run = self._query.require_run(run_id)
+                if self._proposal_is_stale(run, proposal):
+                    raise StaleAgentProposalError(
+                        "The campaign was edited after this proposal was created; "
+                        "re-run the agent to propose against the current design "
+                        "space."
+                    )
+                action = _ACTION_ADAPTER.validate_python(dict(proposal.payload))
+                # Re-check state gates against the live run; a raise here leaves
+                # the proposal Pending (the tx rolls back) so it can still be
+                # rejected.
+                self._reject_illegal_action(run, action)
+
                 initial_design, validation_result = self._dispatch(run, actor, action)
-                self._resolve(proposal, AgentProposalStatus.APPROVED)
+                # Compare-and-set to Approved: if a concurrent request already
+                # resolved this proposal, we lose the race — roll the dispatch
+                # back so the business action commits at most once.
+                won = self._repo.resolve_proposal_if_pending(
+                    self._resolved(proposal, AgentProposalStatus.APPROVED)
+                )
+                if not won:
+                    raise AgentActionRejectedError(
+                        f"Proposal {proposal_id!r} was resolved concurrently."
+                    )
         except (
             ServiceError,
             StateTransitionError,
-            AgentActionRejectedError,
             AgentInvalidActionError,
         ) as exc:
             # The outer transaction rolled the campaign change back; record the
-            # failure on the proposal in its own transaction.
-            self._resolve(proposal, AgentProposalStatus.FAILED, error=str(exc))
+            # failure on the proposal in a *separate* transaction, and only if it
+            # is still Pending — never clobbering a terminal state.
+            self._fail_if_pending(run_id, proposal_id, str(exc))
             raise
 
         return {
@@ -309,12 +358,24 @@ class AgentService:
             EntityNotFoundError: If the run or proposal does not exist.
             AgentActionRejectedError: If the proposal is not Pending.
         """
-        proposal = self._require_proposal(run_id, proposal_id)
-        if proposal.status is not AgentProposalStatus.PENDING:
-            raise AgentActionRejectedError(
-                f"Proposal {proposal_id!r} is {proposal.status.value}, not Pending."
+        self._require_proposal(run_id, proposal_id)  # 404 before taking the lock
+        with self._repo.transaction(immediate=True):
+            proposal = self._require_proposal(run_id, proposal_id)
+            if proposal.status is not AgentProposalStatus.PENDING:
+                raise AgentActionRejectedError(
+                    f"Proposal {proposal_id!r} is {proposal.status.value}, "
+                    "not Pending."
+                )
+            # Compare-and-set to Rejected so a concurrent approve cannot leave the
+            # campaign mutated while this marks it Rejected (and vice versa): only
+            # one of the two wins the transition from Pending.
+            won = self._repo.resolve_proposal_if_pending(
+                self._resolved(proposal, AgentProposalStatus.REJECTED)
             )
-        self._resolve(proposal, AgentProposalStatus.REJECTED)
+            if not won:
+                raise AgentActionRejectedError(
+                    f"Proposal {proposal_id!r} was resolved concurrently."
+                )
         return self.get_thread(run_id)
 
     # Internals -------------------------------------------------------------
@@ -445,22 +506,46 @@ class AgentService:
                 "applied."
             ) from exc
 
-    def _resolve(
-        self,
+    @staticmethod
+    def _proposal_is_stale(run: CampaignRun, proposal: AgentProposal) -> bool:
+        """True when the run moved since the proposal was pinned (§1/§3).
+
+        Checks both halves of the pin: the ``definitionRevisionId`` and the run
+        version token (``updatedAt``, which every status/policy/revision change
+        bumps). Either drifting means approving would apply against a design space
+        the user has since changed.
+        """
+        return (
+            run.definition_revision_id != proposal.base_revision_id
+            or run.updated_at != proposal.base_run_updated_at
+        )
+
+    @staticmethod
+    def _resolved(
         proposal: AgentProposal,
         status: AgentProposalStatus,
         error: str | None = None,
-    ) -> None:
-        """Persist a proposal's terminal state (Approved/Rejected/Failed)."""
-        self._repo.save_agent_proposal(
-            proposal.model_copy(
-                update={
-                    "status": status,
-                    "resolved_at": _now(),
-                    "error": error,
-                }
-            )
+    ) -> AgentProposal:
+        """Return a copy of ``proposal`` stamped with a terminal state."""
+        return proposal.model_copy(
+            update={"status": status, "resolved_at": _now(), "error": error}
         )
+
+    def _fail_if_pending(self, run_id: str, proposal_id: str, error: str) -> None:
+        """Mark a proposal Failed, but only if it is still Pending.
+
+        Runs in its own immediate transaction after the approval transaction has
+        rolled back the campaign change. The compare-and-set means a proposal a
+        concurrent request already resolved is left untouched, so a rolled-back
+        dispatch never overwrites a terminal state.
+        """
+        proposal = self._require_proposal(run_id, proposal_id)
+        if proposal.status is not AgentProposalStatus.PENDING:
+            return
+        with self._repo.transaction(immediate=True):
+            self._repo.resolve_proposal_if_pending(
+                self._resolved(proposal, AgentProposalStatus.FAILED, error=error)
+            )
 
     def _ensure_thread(self, run_id: str) -> AgentThread:
         """Return the run's thread, creating it on first use (one per run)."""

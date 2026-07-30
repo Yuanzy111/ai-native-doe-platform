@@ -383,8 +383,8 @@ function arraysEqual<T>(a: T[], b: T[]): boolean {
 // True when both lists hold the same multiset of values (order aside).
 function isPermutation<T>(a: T[], b: T[]): boolean {
   if (a.length !== b.length) return false
-  const sortKey = (list: T[]) => [...list].map(String).sort().join(' ')
-  return sortKey(a) === sortKey(b)
+  const sorted = (list: T[]) => [...list].map(String).sort()
+  return arraysEqual(sorted(a), sorted(b))
 }
 
 function hydrateConstraint(

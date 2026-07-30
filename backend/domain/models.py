@@ -1152,6 +1152,16 @@ class AgentProposal(_Base):
     base_revision_id: Ident
     """The run's ``definitionRevisionId`` when the proposal was created."""
 
+    base_run_updated_at: AwareDatetime
+    """The run's ``updatedAt`` when the proposal was created (concurrency token).
+
+    Every run mutation (status, policy, or revision change) bumps ``updatedAt``,
+    so this pins the run's full version at proposal time. Together with
+    ``base_revision_id`` it lets an approval detect that the run moved — a status
+    transition, a policy swap, or a re-pin — even when the revision id alone did
+    not change, and reject the stale proposal instead of dispatching it.
+    """
+
     created_at: AwareDatetime
     """The timezone-aware creation timestamp."""
 

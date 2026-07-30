@@ -42,7 +42,7 @@ import {
   postAgentMessage,
   rejectProposal,
 } from '../../../api/agent'
-import { canSendMessage, isProposalStale } from './agentState'
+import { canApproveProposal, canSendMessage } from './agentState'
 import type {
   AgentMessageDto,
   AgentProposalDto,
@@ -111,6 +111,7 @@ export default function CampaignDemoV2() {
 
   const [runId, setRunId] = useState<string | null>(null)
   const [currentRevisionId, setCurrentRevisionId] = useState<string | null>(null)
+  const [currentRunUpdatedAt, setCurrentRunUpdatedAt] = useState<string | null>(null)
   const [serverStatus, setServerStatus] = useState<RunStatus | null>(null)
   const [policyBase, setPolicyBase] = useState<PolicyBase>(DEFAULT_POLICY_BASE)
   const [meta, setMeta] = useState<HeaderMeta>(DEFAULT_META)
@@ -144,6 +145,7 @@ export default function CampaignDemoV2() {
     setPolicyBase(hydrated.policyBase)
     setServerStatus(hydrated.status)
     setCurrentRevisionId(view.pinnedRevision.id)
+    setCurrentRunUpdatedAt(view.campaignRun.updatedAt)
     setMeta({
       title: hydrated.title,
       goal: hydrated.goal,
@@ -202,6 +204,7 @@ export default function CampaignDemoV2() {
     clearRunIdFromUrl()
     setRunId(null)
     setCurrentRevisionId(null)
+    setCurrentRunUpdatedAt(null)
     setServerStatus(null)
     setPolicyBase(DEFAULT_POLICY_BASE)
     setMeta(DEFAULT_META)
@@ -509,15 +512,27 @@ export default function CampaignDemoV2() {
   const handleApproveProposal = async (proposalId: string) => {
     if (runId === null || agentActioningId !== null) return
     // Never let an approval silently overwrite unsaved local edits or apply a
-    // patch minted against a superseded revision. The panel already disables the
-    // button in these cases; this guards the programmatic path too.
-    if (dirty) {
-      setAgentError('Save or discard your design-space changes before approving.')
-      return
-    }
+    // proposal minted against a run that has since moved (revision, status, or
+    // policy). The panel already disables the button in these cases; this guards
+    // the programmatic path with the exact same predicate.
     const proposal = agentPendingProposals.find((p) => p.id === proposalId)
-    if (proposal && isProposalStale(proposal, currentRevisionId)) {
-      setAgentError('This proposal is stale; reject it and ask the agent again.')
+    if (
+      proposal &&
+      !canApproveProposal({
+        proposal,
+        frozen: lifecycleLocked,
+        dirty,
+        currentRevisionId,
+        currentRunUpdatedAt,
+      })
+    ) {
+      if (lifecycleLocked) {
+        setAgentError('The run is frozen; this proposal can no longer be approved.')
+      } else if (dirty) {
+        setAgentError('Save or discard your design-space changes before approving.')
+      } else {
+        setAgentError('This proposal is stale; reject it and ask the agent again.')
+      }
       return
     }
     setAgentActioningId(proposalId)
@@ -675,6 +690,7 @@ export default function CampaignDemoV2() {
           frozen={lifecycleLocked}
           dirty={dirty}
           currentRevisionId={currentRevisionId}
+          currentRunUpdatedAt={currentRunUpdatedAt}
           errorMessage={agentError}
           onDraftChange={setAgentDraft}
           onSend={() => void handleSendMessage()}

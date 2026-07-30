@@ -1,9 +1,9 @@
 import { useEffect, useRef } from 'react'
 import type { AgentMessageDto, AgentProposalDto } from '../../../../api/types'
 import {
+  canApproveProposal,
   canSendMessage,
   describeProposal,
-  isModificationProposal,
   isProposalStale,
 } from '../agentState'
 
@@ -23,6 +23,9 @@ interface Props {
   // The run's current revision id (null before first save). A proposal pinned to
   // a different revision is stale and cannot be approved.
   currentRevisionId: string | null
+  // The run's current version token (its updatedAt, null before first save). A
+  // proposal pinned to a different token is stale even if the revision matches.
+  currentRunUpdatedAt: string | null
   errorMessage: string | null
   onDraftChange: (value: string) => void
   onSend: () => void
@@ -35,6 +38,7 @@ function ProposalCard({
   frozen,
   dirty,
   currentRevisionId,
+  currentRunUpdatedAt,
   actioning,
   onApprove,
   onReject,
@@ -43,14 +47,24 @@ function ProposalCard({
   frozen: boolean
   dirty: boolean
   currentRevisionId: string | null
+  currentRunUpdatedAt: string | null
   actioning: boolean
   onApprove: (proposalId: string) => void
   onReject: (proposalId: string) => void
 }) {
   const summary = describeProposal(proposal)
-  const blocked = frozen && isModificationProposal(proposal)
-  const stale = isProposalStale(proposal, currentRevisionId)
-  const approveDisabled = blocked || stale || dirty || actioning
+  // The disable decision is the single source of truth in `canApproveProposal`;
+  // the individual predicates below only pick which hint to show.
+  const stale = isProposalStale(proposal, currentRevisionId, currentRunUpdatedAt)
+  const approveDisabled =
+    actioning ||
+    !canApproveProposal({
+      proposal,
+      frozen,
+      dirty,
+      currentRevisionId,
+      currentRunUpdatedAt,
+    })
   return (
     <div className="rounded border border-indigo-200 bg-indigo-50 px-3 py-2.5">
       <p className="text-[11px] font-semibold uppercase tracking-wide text-indigo-600">
@@ -73,17 +87,17 @@ function ProposalCard({
           ))}
         </ul>
       )}
-      {blocked && (
+      {frozen && (
         <p className="mt-2 text-xs text-amber-700">
-          The design space is frozen; this change cannot be applied.
+          The run is frozen; this proposal can no longer be approved.
         </p>
       )}
-      {stale && !blocked && (
+      {stale && !frozen && (
         <p className="mt-2 text-xs text-amber-700">
           The design space changed after this proposal; reject it and ask again.
         </p>
       )}
-      {dirty && !stale && !blocked && (
+      {dirty && !stale && !frozen && (
         <p className="mt-2 text-xs text-amber-700">
           Save your design-space changes before approving this proposal.
         </p>
@@ -120,6 +134,7 @@ export default function AgentPanel({
   frozen,
   dirty,
   currentRevisionId,
+  currentRunUpdatedAt,
   errorMessage,
   onDraftChange,
   onSend,
@@ -190,6 +205,7 @@ export default function AgentPanel({
                 frozen={frozen}
                 dirty={dirty}
                 currentRevisionId={currentRevisionId}
+                currentRunUpdatedAt={currentRunUpdatedAt}
                 actioning={actioningProposalId === proposal.id}
                 onApprove={onApprove}
                 onReject={onReject}

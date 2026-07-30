@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 
 from backend.domain.models import Direction
@@ -210,6 +210,14 @@ class AgentTurn(_AgentBase):
 
     message: Annotated[str, Field(min_length=1)]
     proposed_action: AgentAction | None = None
+
+    @field_validator("message")
+    @classmethod
+    def _reject_blank_message(cls, value: str) -> str:
+        """Reject a whitespace-only message (``min_length`` alone allows ``" "``)."""
+        if not value.strip():
+            raise ValueError("The assistant message must not be blank.")
+        return value
 
 
 __all__ = [

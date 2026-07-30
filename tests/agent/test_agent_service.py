@@ -10,6 +10,7 @@ deterministic pipeline end to end.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -69,6 +70,26 @@ def _turn(message: str, action: dict | None = None) -> str:
     if action is not None:
         body["proposedAction"] = action
     return json.dumps(body)
+
+
+class _MutatingModel:
+    """A fake model that mutates the run *during* the (slow) generate call.
+
+    Simulates a concurrent writer that changes the campaign while the agent is
+    thinking: the ``side_effect`` runs before the queued response is returned, so
+    by the time :meth:`AgentService.post_message` reopens the write transaction
+    the run has already moved.
+    """
+
+    def __init__(self, response: str, side_effect) -> None:
+        self._response = response
+        self._side_effect = side_effect
+        self.calls: list[tuple[str, list[dict[str, str]]]] = []
+
+    def generate(self, system_prompt: str, messages: list[dict[str, str]]) -> str:
+        self.calls.append((system_prompt, messages))
+        self._side_effect()
+        return self._response
 
 
 @pytest.fixture
@@ -387,4 +408,153 @@ def test_model_history_is_capped(agent, fake_agent_model):
     # The full transcript is still retained in SQLite.
     assert len(agent.get_thread(_RUN_ID)["messages"]) == 2 * (
         _MAX_HISTORY_MESSAGES + 5
+    )
+
+
+# §2 — the run moved during the (slow) model call: stale, and no orphans -------
+
+
+def test_status_change_during_model_call_is_stale(seeded_run, application):
+    """A status transition mid-call is caught even though the revision is same.
+
+    The run token folds in ``status`` and ``updatedAt``, so a concurrent
+    validate (Draft→DesignSpaceValidated) that leaves the pinned revision id
+    untouched is still detected, and nothing is persisted.
+    """
+
+    def _validate_midflight() -> None:
+        application.validate_design_space(_RUN_ID, _ACTOR)
+
+    model = _MutatingModel(_turn("Adding it.", _ADD_PARAMETER), _validate_midflight)
+    agent = AgentService(seeded_run, model, application, RunQueryService(seeded_run))
+
+    with pytest.raises(StaleAgentProposalError):
+        agent.post_message(_RUN_ID, _ACTOR, "Add temperature")
+
+    assert seeded_run.get_run(_RUN_ID).status is RunStatus.DESIGN_SPACE_VALIDATED
+    thread = agent.get_thread(_RUN_ID)
+    assert thread["messages"] == []
+    assert thread["pendingProposals"] == []
+    assert _param_count(seeded_run) == 2
+
+
+def test_policy_swap_during_model_call_is_stale(seeded_run, application):
+    """Swapping only the policy *identity* is caught by the token.
+
+    The revision id and ``updatedAt`` are left untouched; only
+    ``optimizationPolicy.id`` changes. Because the token includes the policy
+    identity, the proposal is still stale and no thread/message/proposal lands.
+    """
+
+    def _swap_policy() -> None:
+        run = seeded_run.get_run(_RUN_ID)
+        swapped = run.model_copy(
+            update={
+                "optimization_policy": run.optimization_policy.model_copy(
+                    update={"id": "op-2"}
+                )
+            }
+        )
+        with seeded_run.transaction(immediate=True):
+            seeded_run.save_run(swapped)
+
+    model = _MutatingModel(_turn("Adding it.", _ADD_PARAMETER), _swap_policy)
+    agent = AgentService(seeded_run, model, application, RunQueryService(seeded_run))
+
+    with pytest.raises(StaleAgentProposalError):
+        agent.post_message(_RUN_ID, _ACTOR, "Add temperature")
+
+    assert seeded_run.get_run(_RUN_ID).optimization_policy.id == "op-2"
+    thread = agent.get_thread(_RUN_ID)
+    assert thread["messages"] == []
+    assert thread["pendingProposals"] == []
+
+
+# §5 — a proposal resolves, and dispatches, at most once -----------------------
+
+
+def test_double_approve_dispatches_once(agent, fake_agent_model, seeded_run):
+    fake_agent_model.queue(_turn("Adding it.", _ADD_PARAMETER))
+    proposal_id = agent.post_message(_RUN_ID, _ACTOR, "Add temperature")[
+        "pendingProposals"
+    ][0]["id"]
+
+    agent.approve_proposal(_RUN_ID, proposal_id, _ACTOR)
+    # The second approval finds the proposal already terminal and refuses; the
+    # patch is never applied twice.
+    with pytest.raises(AgentActionRejectedError):
+        agent.approve_proposal(_RUN_ID, proposal_id, _ACTOR)
+
+    assert _param_count(seeded_run) == 3
+    assert (
+        seeded_run.get_agent_proposal(proposal_id).status
+        is AgentProposalStatus.APPROVED
+    )
+
+
+def test_approve_then_reject_keeps_single_terminal(agent, fake_agent_model, seeded_run):
+    fake_agent_model.queue(_turn("Adding it.", _ADD_PARAMETER))
+    proposal_id = agent.post_message(_RUN_ID, _ACTOR, "Add temperature")[
+        "pendingProposals"
+    ][0]["id"]
+
+    agent.approve_proposal(_RUN_ID, proposal_id, _ACTOR)
+    with pytest.raises(AgentActionRejectedError):
+        agent.reject_proposal(_RUN_ID, proposal_id, _ACTOR)
+
+    # The action ran once and the proposal stays Approved — never
+    # business-executed then flipped to Rejected.
+    assert _param_count(seeded_run) == 3
+    assert (
+        seeded_run.get_agent_proposal(proposal_id).status
+        is AgentProposalStatus.APPROVED
+    )
+
+
+def test_reject_then_approve_never_dispatches(agent, fake_agent_model, seeded_run):
+    fake_agent_model.queue(_turn("Adding it.", _ADD_PARAMETER))
+    proposal_id = agent.post_message(_RUN_ID, _ACTOR, "Add temperature")[
+        "pendingProposals"
+    ][0]["id"]
+
+    agent.reject_proposal(_RUN_ID, proposal_id, _ACTOR)
+    with pytest.raises(AgentActionRejectedError):
+        agent.approve_proposal(_RUN_ID, proposal_id, _ACTOR)
+
+    assert _param_count(seeded_run) == 2
+    assert (
+        seeded_run.get_agent_proposal(proposal_id).status
+        is AgentProposalStatus.REJECTED
+    )
+
+
+def test_resolve_proposal_if_pending_has_single_winner(
+    agent, fake_agent_model, seeded_run
+):
+    """The repo-level compare-and-set is what makes the above single-winner.
+
+    The first transition from Pending wins; any later one is a no-op, so the
+    terminal state a concurrent request set can never be overwritten.
+    """
+    fake_agent_model.queue(_turn("Adding it.", _ADD_PARAMETER))
+    proposal_id = agent.post_message(_RUN_ID, _ACTOR, "Add temperature")[
+        "pendingProposals"
+    ][0]["id"]
+    proposal = seeded_run.get_agent_proposal(proposal_id)
+
+    resolved_at = datetime.now(timezone.utc)
+    first = proposal.model_copy(
+        update={"status": AgentProposalStatus.APPROVED, "resolved_at": resolved_at}
+    )
+    second = proposal.model_copy(
+        update={"status": AgentProposalStatus.REJECTED, "resolved_at": resolved_at}
+    )
+    with seeded_run.transaction(immediate=True):
+        assert seeded_run.resolve_proposal_if_pending(first) is True
+    with seeded_run.transaction(immediate=True):
+        assert seeded_run.resolve_proposal_if_pending(second) is False
+
+    assert (
+        seeded_run.get_agent_proposal(proposal_id).status
+        is AgentProposalStatus.APPROVED
     )
