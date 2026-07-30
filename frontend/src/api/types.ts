@@ -315,6 +315,9 @@ export interface ApproveProposalResponseDto {
   view: RunViewDto
   // Present only when a generate-initial-design proposal was approved.
   initialDesign: InitialDesignResponseDto | null
+  // Present only when a validate-design-space proposal was approved; carries the
+  // real validation outcome so the UI can surface blocking issues.
+  validationResult: ValidationResultDto | null
 }
 
 // --- Request bodies --------------------------------------------------------

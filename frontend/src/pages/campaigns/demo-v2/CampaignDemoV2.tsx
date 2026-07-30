@@ -4,7 +4,6 @@ import StageNav from './components/StageNav'
 import MainWorkspace from './components/MainWorkspace'
 import AgentPanel from './components/AgentPanel'
 import RecommendationsView from './components/RecommendationsView'
-import ConstraintDialog from './components/ConstraintDialog'
 import ParameterDialog from './components/ParameterDialog'
 import ObjectiveDialog from './components/ObjectiveDialog'
 import ToastStack from './components/ToastStack'
@@ -43,7 +42,7 @@ import {
   postAgentMessage,
   rejectProposal,
 } from '../../../api/agent'
-import { canSendMessage } from './agentState'
+import { canSendMessage, isProposalStale } from './agentState'
 import type {
   AgentMessageDto,
   AgentProposalDto,
@@ -108,11 +107,10 @@ export default function CampaignDemoV2() {
 
   const [constraint, setConstraint] = useState<ConstraintState>({
     choice: null,
-    customExpression: '',
   })
-  const [constraintDialogOpen, setConstraintDialogOpen] = useState(false)
 
   const [runId, setRunId] = useState<string | null>(null)
+  const [currentRevisionId, setCurrentRevisionId] = useState<string | null>(null)
   const [serverStatus, setServerStatus] = useState<RunStatus | null>(null)
   const [policyBase, setPolicyBase] = useState<PolicyBase>(DEFAULT_POLICY_BASE)
   const [meta, setMeta] = useState<HeaderMeta>(DEFAULT_META)
@@ -145,6 +143,7 @@ export default function CampaignDemoV2() {
     setConstraint(hydrated.constraint)
     setPolicyBase(hydrated.policyBase)
     setServerStatus(hydrated.status)
+    setCurrentRevisionId(view.pinnedRevision.id)
     setMeta({
       title: hydrated.title,
       goal: hydrated.goal,
@@ -202,12 +201,13 @@ export default function CampaignDemoV2() {
   const startNewDraft = () => {
     clearRunIdFromUrl()
     setRunId(null)
+    setCurrentRevisionId(null)
     setServerStatus(null)
     setPolicyBase(DEFAULT_POLICY_BASE)
     setMeta(DEFAULT_META)
     setParameters(initialParameters)
     setObjectives(initialObjectives)
-    setConstraint({ choice: null, customExpression: '' })
+    setConstraint({ choice: null })
     setUnsupported([])
     setBlockingIssues([])
     setDirty(false)
@@ -252,28 +252,17 @@ export default function CampaignDemoV2() {
 
   const handleChooseConstraint = (choice: ConstraintChoice) => {
     if (locked) return
-    if (choice === 'custom') {
-      setConstraintDialogOpen(true)
-      return
-    }
     if (choice === 'fixed-sum') {
       // A freshly authored fixed-sum gets a new stable id and a null resolvedAt;
       // a hydrated one keeps the server's values via applyView.
       setConstraint({
         choice,
-        customExpression: '',
         constraintId: newFixedSumConstraintId(),
         resolvedAt: null,
       })
     } else {
-      setConstraint({ choice, customExpression: '' })
+      setConstraint({ choice })
     }
-    markDirty()
-  }
-
-  const handleConstraintDialogConfirm = (expression: string) => {
-    setConstraint({ choice: 'custom', customExpression: expression })
-    setConstraintDialogOpen(false)
     markDirty()
   }
 
@@ -497,7 +486,10 @@ export default function CampaignDemoV2() {
     setAgentSending(true)
     try {
       let targetRunId = runId
-      if (targetRunId === null) {
+      // Persist any unsaved local edits before the agent reads the design space,
+      // so it never reasons over stale server state. A failed save aborts the
+      // send rather than silently talking to the agent about the wrong campaign.
+      if (targetRunId === null || dirty) {
         const view = await persist()
         if (view === null) return
         targetRunId = view.campaignRun.id
@@ -516,11 +508,36 @@ export default function CampaignDemoV2() {
 
   const handleApproveProposal = async (proposalId: string) => {
     if (runId === null || agentActioningId !== null) return
+    // Never let an approval silently overwrite unsaved local edits or apply a
+    // patch minted against a superseded revision. The panel already disables the
+    // button in these cases; this guards the programmatic path too.
+    if (dirty) {
+      setAgentError('Save or discard your design-space changes before approving.')
+      return
+    }
+    const proposal = agentPendingProposals.find((p) => p.id === proposalId)
+    if (proposal && isProposalStale(proposal, currentRevisionId)) {
+      setAgentError('This proposal is stale; reject it and ask the agent again.')
+      return
+    }
     setAgentActioningId(proposalId)
     setAgentError(null)
     try {
       const response = await approveProposal(runId, proposalId)
       applyView(response.view)
+      // Approving a validate proposal returns the real validation outcome:
+      // "approved" is not "validation passed", so surface blocking issues.
+      if (response.validationResult !== null) {
+        setBlockingIssues(
+          response.validationResult.issues.filter((issue) => issue.severity === 'blocking'),
+        )
+        pushToast(
+          response.validationResult.ok ? 'success' : 'warning',
+          response.validationResult.ok
+            ? 'Validation passed.'
+            : 'Proposal approved, but validation found blocking issues.',
+        )
+      }
       await refreshThread(runId)
       // A generate proposal returns a fresh batch; jump to the Recommendations
       // stage which hydrates from the real backend values (never fabricated).
@@ -528,7 +545,9 @@ export default function CampaignDemoV2() {
         setActiveStage('recommendations')
         writeStageToUrl('recommendations')
       }
-      pushToast('success', 'Proposal approved.')
+      if (response.validationResult === null) {
+        pushToast('success', 'Proposal approved.')
+      }
     } catch (err) {
       setAgentError(
         err instanceof ApiError ? `${err.code}: ${err.message}` : 'Failed to approve the proposal.',
@@ -654,6 +673,8 @@ export default function CampaignDemoV2() {
           sending={agentSending}
           actioningProposalId={agentActioningId}
           frozen={lifecycleLocked}
+          dirty={dirty}
+          currentRevisionId={currentRevisionId}
           errorMessage={agentError}
           onDraftChange={setAgentDraft}
           onSend={() => void handleSendMessage()}
@@ -675,11 +696,6 @@ export default function CampaignDemoV2() {
         existingObjectives={objectives}
         onCancel={() => setObjectiveDialogOpen(false)}
         onSave={handleSaveObjective}
-      />
-      <ConstraintDialog
-        open={constraintDialogOpen}
-        onCancel={() => setConstraintDialogOpen(false)}
-        onConfirm={handleConstraintDialogConfirm}
       />
       <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </div>

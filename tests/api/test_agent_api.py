@@ -11,11 +11,13 @@ mutates the campaign only on approval, and the bad-output 502.
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.adapters.baybe import BayBEAdapter
+from backend.agent.model import OpenAICompatibleAgentModel
 from backend.api import create_app
 
 _ADD_PARAMETER = {
@@ -31,6 +33,8 @@ _ADD_PARAMETER = {
     },
 }
 _GENERATE = {"kind": "generateInitialDesign"}
+_VALIDATE = {"kind": "validateDesignSpace"}
+_SECRET = "sk-super-secret-key"
 
 
 def _turn(message: str, action: dict | None = None) -> str:
@@ -173,3 +177,88 @@ def test_reject_does_not_mutate(
 
     view = agent_client.get(f"/api/v1/campaign-runs/{run_id}").json()
     assert len(view["pinnedRevision"]["parameters"]) == 2
+
+
+# §8 — configured env but the optional 'openai' extra is absent ----------------
+
+
+def test_missing_sdk_returns_503_without_leaking_key(
+    tmp_path, monkeypatch, headers, make_payload
+) -> None:
+    # An app configured with a real OpenAI-compatible model still boots when the
+    # SDK is absent; the failure surfaces only on the first message, as a 503
+    # with no API key or traceback in the body.
+    monkeypatch.setitem(sys.modules, "openai", None)
+    model = OpenAICompatibleAgentModel(
+        base_url="https://example.test/v1", api_key=_SECRET, model="gpt-x"
+    )
+    app = create_app(
+        db_path=str(tmp_path / "missing-sdk.db"),
+        adapter=BayBEAdapter(),
+        agent_model=model,
+    )
+    with TestClient(app) as client:
+        run_id = _create_run(client, headers, make_payload)
+        response = client.post(
+            f"/api/v1/campaign-runs/{run_id}/agent/messages",
+            json={"message": "Hi"},
+            headers=headers,
+        )
+    assert response.status_code == 503
+    body = response.json()
+    assert body["code"] == "AGENT_DEPENDENCY_MISSING"
+    # The key never leaks, and no traceback frames surface in the wire response.
+    serialized = json.dumps(body)
+    assert _SECRET not in serialized
+    assert "Traceback" not in serialized
+
+
+# §9 — message length bounds ---------------------------------------------------
+
+
+def test_empty_message_rejected(agent_client, headers, make_payload) -> None:
+    run_id = _create_run(agent_client, headers, make_payload)
+    response = agent_client.post(
+        f"/api/v1/campaign-runs/{run_id}/agent/messages",
+        json={"message": ""},
+        headers=headers,
+    )
+    assert response.status_code == 422
+
+
+def test_overlong_message_rejected(agent_client, headers, make_payload) -> None:
+    run_id = _create_run(agent_client, headers, make_payload)
+    response = agent_client.post(
+        f"/api/v1/campaign-runs/{run_id}/agent/messages",
+        json={"message": "x" * 4001},
+        headers=headers,
+    )
+    assert response.status_code == 422
+
+
+# §5 — approving a validate proposal returns the real validation result --------
+
+
+def test_approve_validate_returns_validation_result(
+    agent_client, fake_agent_model, headers, make_payload
+) -> None:
+    run_id = _create_run(agent_client, headers, make_payload)
+
+    fake_agent_model.queue(_turn("Validate please.", _VALIDATE))
+    sent = agent_client.post(
+        f"/api/v1/campaign-runs/{run_id}/agent/messages",
+        json={"message": "Validate"},
+        headers=headers,
+    )
+    proposal_id = sent.json()["pendingProposals"][0]["id"]
+
+    approved = agent_client.post(
+        f"/api/v1/campaign-runs/{run_id}/agent/proposals/{proposal_id}/approve",
+        headers=headers,
+    )
+    assert approved.status_code == 200
+    body = approved.json()
+    assert body["proposal"]["status"] == "Approved"
+    assert body["initialDesign"] is None
+    assert body["validationResult"] is not None
+    assert body["validationResult"]["ok"] is True

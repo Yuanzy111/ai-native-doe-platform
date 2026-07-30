@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { canSendMessage, describeProposal, isModificationProposal } from './agentState'
+import {
+  canApproveProposal,
+  canSendMessage,
+  describeProposal,
+  isModificationProposal,
+  isProposalStale,
+} from './agentState'
 import type { AgentProposalDto } from '../../../api/types'
 
 function proposal(overrides: Partial<AgentProposalDto> = {}): AgentProposalDto {
@@ -38,6 +44,47 @@ describe('isModificationProposal', () => {
     expect(isModificationProposal(proposal({ kind: 'designSpacePatch' }))).toBe(true)
     expect(isModificationProposal(proposal({ kind: 'validateDesignSpace' }))).toBe(false)
     expect(isModificationProposal(proposal({ kind: 'generateInitialDesign' }))).toBe(false)
+  })
+})
+
+describe('isProposalStale', () => {
+  it('is fresh when the base revision matches the current one', () => {
+    expect(isProposalStale(proposal({ baseRevisionId: 'rev-1' }), 'rev-1')).toBe(false)
+  })
+
+  it('is stale when the current revision has moved on', () => {
+    expect(isProposalStale(proposal({ baseRevisionId: 'rev-1' }), 'rev-2')).toBe(true)
+  })
+
+  it('is stale (undecidable) before the run is persisted', () => {
+    expect(isProposalStale(proposal({ baseRevisionId: 'rev-1' }), null)).toBe(true)
+  })
+})
+
+describe('canApproveProposal', () => {
+  const base = { proposal: proposal({ baseRevisionId: 'rev-1' }), currentRevisionId: 'rev-1' }
+
+  it('allows approval of a fresh proposal on a clean, unfrozen design space', () => {
+    expect(canApproveProposal({ ...base, frozen: false, dirty: false })).toBe(true)
+  })
+
+  it('blocks approval while the design space is dirty', () => {
+    expect(canApproveProposal({ ...base, frozen: false, dirty: true })).toBe(false)
+  })
+
+  it('blocks approval while the design space is frozen', () => {
+    expect(canApproveProposal({ ...base, frozen: true, dirty: false })).toBe(false)
+  })
+
+  it('blocks approval of a stale proposal', () => {
+    expect(
+      canApproveProposal({
+        proposal: proposal({ baseRevisionId: 'rev-1' }),
+        currentRevisionId: 'rev-2',
+        frozen: false,
+        dirty: false,
+      }),
+    ).toBe(false)
   })
 })
 

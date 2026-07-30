@@ -1,6 +1,11 @@
 import { useEffect, useRef } from 'react'
 import type { AgentMessageDto, AgentProposalDto } from '../../../../api/types'
-import { canSendMessage, describeProposal, isModificationProposal } from '../agentState'
+import {
+  canSendMessage,
+  describeProposal,
+  isModificationProposal,
+  isProposalStale,
+} from '../agentState'
 
 interface Props {
   experimentSummary: string
@@ -12,6 +17,12 @@ interface Props {
   // True once the run's lifecycle has advanced past validation. Modification
   // proposals cannot be approved while frozen (the agent stays read/explain).
   frozen: boolean
+  // Unsaved local design-space edits: approving would clobber them, so Approve
+  // is disabled with a save-first hint until they are persisted.
+  dirty: boolean
+  // The run's current revision id (null before first save). A proposal pinned to
+  // a different revision is stale and cannot be approved.
+  currentRevisionId: string | null
   errorMessage: string | null
   onDraftChange: (value: string) => void
   onSend: () => void
@@ -22,24 +33,37 @@ interface Props {
 function ProposalCard({
   proposal,
   frozen,
+  dirty,
+  currentRevisionId,
   actioning,
   onApprove,
   onReject,
 }: {
   proposal: AgentProposalDto
   frozen: boolean
+  dirty: boolean
+  currentRevisionId: string | null
   actioning: boolean
   onApprove: (proposalId: string) => void
   onReject: (proposalId: string) => void
 }) {
   const summary = describeProposal(proposal)
   const blocked = frozen && isModificationProposal(proposal)
+  const stale = isProposalStale(proposal, currentRevisionId)
+  const approveDisabled = blocked || stale || dirty || actioning
   return (
     <div className="rounded border border-indigo-200 bg-indigo-50 px-3 py-2.5">
       <p className="text-[11px] font-semibold uppercase tracking-wide text-indigo-600">
         Proposed action
       </p>
-      <p className="mt-1 text-sm font-medium text-indigo-900">{summary.title}</p>
+      <p className="mt-1 text-sm font-medium text-indigo-900">
+        {summary.title}
+        {stale && (
+          <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-700">
+            Stale
+          </span>
+        )}
+      </p>
       {summary.lines.length > 0 && (
         <ul className="mt-1 flex flex-col gap-0.5 text-xs text-indigo-800">
           {summary.lines.map((line, index) => (
@@ -54,10 +78,20 @@ function ProposalCard({
           The design space is frozen; this change cannot be applied.
         </p>
       )}
+      {stale && !blocked && (
+        <p className="mt-2 text-xs text-amber-700">
+          The design space changed after this proposal; reject it and ask again.
+        </p>
+      )}
+      {dirty && !stale && !blocked && (
+        <p className="mt-2 text-xs text-amber-700">
+          Save your design-space changes before approving this proposal.
+        </p>
+      )}
       <div className="mt-2.5 flex items-center gap-2">
         <button
           type="button"
-          disabled={blocked || actioning}
+          disabled={approveDisabled}
           onClick={() => onApprove(proposal.id)}
           className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
         >
@@ -84,6 +118,8 @@ export default function AgentPanel({
   sending,
   actioningProposalId,
   frozen,
+  dirty,
+  currentRevisionId,
   errorMessage,
   onDraftChange,
   onSend,
@@ -152,6 +188,8 @@ export default function AgentPanel({
                 key={proposal.id}
                 proposal={proposal}
                 frozen={frozen}
+                dirty={dirty}
+                currentRevisionId={currentRevisionId}
                 actioning={actioningProposalId === proposal.id}
                 onApprove={onApprove}
                 onReject={onReject}

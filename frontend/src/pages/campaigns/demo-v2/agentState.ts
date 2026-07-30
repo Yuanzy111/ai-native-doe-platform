@@ -22,6 +22,33 @@ export function isModificationProposal(proposal: AgentProposalDto): boolean {
   return proposal.kind === 'designSpacePatch'
 }
 
+// A proposal is stale when it was minted against a revision that no longer
+// matches the run's current one — approving it would apply a patch on top of a
+// design space the user has since changed. `currentRevisionId` is null before a
+// run is persisted, in which case staleness is undecidable and we treat it as
+// stale to force a save first.
+export function isProposalStale(
+  proposal: AgentProposalDto,
+  currentRevisionId: string | null,
+): boolean {
+  if (currentRevisionId === null) return true
+  return proposal.baseRevisionId !== currentRevisionId
+}
+
+// Approval is allowed only when nothing would silently clobber the user's work:
+// the design space must be neither frozen nor dirty (unsaved local edits), and
+// the proposal must be pinned to the current revision.
+export function canApproveProposal(params: {
+  proposal: AgentProposalDto
+  frozen: boolean
+  dirty: boolean
+  currentRevisionId: string | null
+}): boolean {
+  const { proposal, frozen, dirty, currentRevisionId } = params
+  if (frozen || dirty) return false
+  return !isProposalStale(proposal, currentRevisionId)
+}
+
 export interface ProposalSummary {
   title: string
   lines: string[]

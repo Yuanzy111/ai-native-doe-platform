@@ -206,9 +206,9 @@ AgentAction = Annotated[
 
 
 class AgentTurn(_AgentBase):
-    """One assistant turn: a message plus at most one proposed action."""
+    """One assistant turn: a non-empty message plus at most one proposed action."""
 
-    message: str
+    message: Annotated[str, Field(min_length=1)]
     proposed_action: AgentAction | None = None
 
 

@@ -34,7 +34,7 @@ function inputs(overrides: Partial<DesignSpaceInputs> = {}): DesignSpaceInputs {
   return {
     parameters: [RESIN, HARDENER],
     objectives: [objective('o-hardness', 'Hardness', 'Maximize')],
-    constraint: { choice: 'no-constraint', customExpression: '' } satisfies ConstraintState,
+    constraint: { choice: 'no-constraint' } satisfies ConstraintState,
     policyBase: DEFAULT_POLICY_BASE,
     ...overrides,
   }
@@ -83,7 +83,7 @@ describe('toDesignSpaceBody', () => {
 
   it('maps a fixed-sum constraint to a LinearEquality over resin + hardener', () => {
     const body = toDesignSpaceBody(
-      inputs({ constraint: { choice: 'fixed-sum', customExpression: '' } }),
+      inputs({ constraint: { choice: 'fixed-sum' } }),
     )
     expect(body.constraintsConfirmed).toBe(true)
     expect(body.constraints).toEqual([
@@ -99,21 +99,15 @@ describe('toDesignSpaceBody', () => {
   })
 
   it('confirms an explicit no-constraint choice with an empty set', () => {
-    const body = toDesignSpaceBody(inputs({ constraint: { choice: 'no-constraint', customExpression: '' } }))
+    const body = toDesignSpaceBody(inputs({ constraint: { choice: 'no-constraint' } }))
     expect(body.constraints).toEqual([])
     expect(body.constraintsConfirmed).toBe(true)
   })
 
   it('leaves an unresolved constraint unconfirmed (savable, not validatable)', () => {
-    const body = toDesignSpaceBody(inputs({ constraint: { choice: null, customExpression: '' } }))
+    const body = toDesignSpaceBody(inputs({ constraint: { choice: null } }))
     expect(body.constraints).toEqual([])
     expect(body.constraintsConfirmed).toBe(false)
-  })
-
-  it('refuses to submit a custom constraint expression', () => {
-    expect(() =>
-      toDesignSpaceBody(inputs({ constraint: { choice: 'custom', customExpression: 'a + b <= 1' } })),
-    ).toThrow(MappingError)
   })
 
   it('parses finite discrete values', () => {
@@ -234,14 +228,14 @@ describe('hydrateFromView', () => {
       unit: '',
       description: '',
     })
-    expect(hydrated.constraint).toEqual({ choice: 'no-constraint', customExpression: '' })
+    expect(hydrated.constraint).toEqual({ choice: 'no-constraint' })
     expect(hydrated.status).toBe('DesignSpaceValidated')
     expect(hydrated.batchSize).toBe(4)
     expect(hydrated.budgetTotal).toBe(12)
   })
 
   it('round-trips a design space through the server view', () => {
-    const original = inputs({ constraint: { choice: 'fixed-sum', customExpression: '' } })
+    const original = inputs({ constraint: { choice: 'fixed-sum' } })
     const body = toDesignSpaceBody(original)
     // Echo the request back into a view as the server would after a save.
     const echoed: RunViewDto = {

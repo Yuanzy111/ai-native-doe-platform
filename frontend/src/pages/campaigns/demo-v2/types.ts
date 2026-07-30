@@ -57,11 +57,10 @@ export interface ObjectiveFieldErrors {
   name?: string
 }
 
-export type ConstraintChoice = 'fixed-sum' | 'no-constraint' | 'custom'
+export type ConstraintChoice = 'fixed-sum' | 'no-constraint'
 
 export interface ConstraintState {
   choice: ConstraintChoice | null
-  customExpression: string
   // Internal mapping bookkeeping, never shown in the UI: preserved from the
   // server so a hydrate -> save round-trip returns the original fixed-sum
   // constraint id and resolvedAt untouched instead of rewriting them.

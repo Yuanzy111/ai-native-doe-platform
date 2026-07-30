@@ -39,6 +39,8 @@ from backend.adapters.errors import (
 )
 from backend.agent.errors import (
     AgentActionRejectedError,
+    AgentDependencyMissingError,
+    AgentInvalidActionError,
     AgentModelError,
     AgentNotConfiguredError,
     InvalidAgentOutputError,
@@ -166,11 +168,27 @@ def register_exception_handlers(app: FastAPI) -> None:
     ) -> JSONResponse:
         return _json(409, "STALE_AGENT_PROPOSAL", str(exc))
 
+    @app.exception_handler(AgentDependencyMissingError)
+    async def _handle_agent_dependency_missing(
+        _: Request, exc: AgentDependencyMissingError
+    ) -> JSONResponse:
+        # The optional SDK is absent; the app still boots, and this route alone
+        # reports the missing dependency with no traceback/key/vendor detail.
+        return _json(503, "AGENT_DEPENDENCY_MISSING", str(exc))
+
     @app.exception_handler(InvalidAgentOutputError)
     async def _handle_invalid_agent_output(
         _: Request, exc: InvalidAgentOutputError
     ) -> JSONResponse:
         return _json(502, "AGENT_INVALID_OUTPUT", str(exc))
+
+    @app.exception_handler(AgentInvalidActionError)
+    async def _handle_agent_invalid_action(
+        _: Request, exc: AgentInvalidActionError
+    ) -> JSONResponse:
+        # The model proposed a structurally valid action that carries an invalid
+        # domain value; distinct from a bad client request.
+        return _json(422, "AGENT_INVALID_ACTION", str(exc))
 
     @app.exception_handler(AgentModelError)
     async def _handle_agent_model_error(

@@ -82,7 +82,7 @@ class SaveDesignSpaceRequest(_RequestBase):
 class PostAgentMessageRequest(_RequestBase):
     """The body of ``POST /api/v1/campaign-runs/{runId}/agent/messages``."""
 
-    message: str = Field(min_length=1)
+    message: str = Field(min_length=1, max_length=4000)
 
 
 __all__ = [

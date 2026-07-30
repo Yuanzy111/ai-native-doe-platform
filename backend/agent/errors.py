@@ -17,12 +17,34 @@ class AgentNotConfiguredError(AgentError):
     """Raised when no agent model is configured (missing ``AGENT_*`` env)."""
 
 
+class AgentDependencyMissingError(AgentError):
+    """Raised when the model is configured but the optional SDK is not installed.
+
+    The ``AGENT_*`` env is present, so the app boots and the model is wired, but
+    the optional ``agent`` extra (``openai``) is absent. Surfaced only on first
+    :meth:`generate`, never at construction, so the API keeps serving; the agent
+    message endpoint then reports ``AGENT_DEPENDENCY_MISSING`` (503). No
+    traceback, API key, or vendor payload is ever carried in the message.
+    """
+
+
 class AgentModelError(AgentError):
     """Raised when the underlying model call fails (network/provider error)."""
 
 
 class InvalidAgentOutputError(AgentError):
     """Raised when the model's output is not a valid :class:`AgentTurn`."""
+
+
+class AgentInvalidActionError(AgentError):
+    """Raised when a model-proposed action carries an invalid domain value.
+
+    The action parsed against the contract but cannot be turned into a valid
+    domain object (e.g. a continuous parameter with ``lowerBound >= upperBound``,
+    or an empty categorical value set). Distinct from a generic request
+    ``VALIDATION_ERROR`` so the client can tell "the model produced a bad action"
+    apart from "you sent a bad request"; maps to ``AGENT_INVALID_ACTION``.
+    """
 
 
 class StaleAgentProposalError(AgentError):
@@ -44,8 +66,10 @@ class AgentActionRejectedError(AgentError):
 __all__ = [
     "AgentError",
     "AgentNotConfiguredError",
+    "AgentDependencyMissingError",
     "AgentModelError",
     "InvalidAgentOutputError",
+    "AgentInvalidActionError",
     "StaleAgentProposalError",
     "AgentActionRejectedError",
 ]

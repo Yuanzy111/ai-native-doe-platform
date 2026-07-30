@@ -15,14 +15,15 @@ import pytest
 
 from backend.agent.errors import (
     AgentActionRejectedError,
+    AgentInvalidActionError,
     AgentNotConfiguredError,
     InvalidAgentOutputError,
     StaleAgentProposalError,
 )
 from backend.agent.service import AgentService
 from backend.api.query import RunQueryService
-from backend.application import ApplicationService
-from backend.domain.models import RunStatus
+from backend.application import ApplicationService, ServiceError
+from backend.domain.models import AgentProposalStatus, RunStatus
 
 _RUN_ID = "run-1"
 _ACTOR = "user-1"
@@ -41,6 +42,18 @@ _ADD_PARAMETER = {
 }
 _VALIDATE = {"kind": "validateDesignSpace"}
 _GENERATE = {"kind": "generateInitialDesign"}
+_INVALID_BOUNDS = {
+    "kind": "designSpacePatch",
+    "patch": {
+        "op": "addParameter",
+        "parameter": {
+            "type": "Continuous",
+            "name": "Bad",
+            "lowerBound": 80,
+            "upperBound": 20,
+        },
+    },
+}
 _UPDATE_UNKNOWN = {
     "kind": "designSpacePatch",
     "patch": {
@@ -206,3 +219,172 @@ def test_unconfigured_model_raises(seeded_run):
     )
     with pytest.raises(AgentNotConfiguredError):
         agent.post_message(_RUN_ID, _ACTOR, "Hi")
+
+
+# §6 — atomic turn: a failure leaves no orphaned message or proposal -----------
+
+
+def test_invalid_json_leaves_no_orphaned_message(agent, fake_agent_model):
+    fake_agent_model.queue("this is not json")
+    with pytest.raises(InvalidAgentOutputError):
+        agent.post_message(_RUN_ID, _ACTOR, "Hi")
+    thread = agent.get_thread(_RUN_ID)
+    assert thread["messages"] == []
+    assert thread["pendingProposals"] == []
+
+
+def test_invalid_action_bounds_raise_invalid_action_no_orphans(
+    agent, fake_agent_model, seeded_run
+):
+    fake_agent_model.queue(_turn("Adding it.", _INVALID_BOUNDS))
+    with pytest.raises(AgentInvalidActionError):
+        agent.post_message(_RUN_ID, _ACTOR, "Add a bad parameter")
+    thread = agent.get_thread(_RUN_ID)
+    assert thread["messages"] == []
+    assert thread["pendingProposals"] == []
+    assert _param_count(seeded_run) == 2
+
+
+def test_illegal_action_leaves_no_orphaned_message(agent, fake_agent_model):
+    fake_agent_model.queue(_turn("Updating.", _UPDATE_UNKNOWN))
+    with pytest.raises(AgentActionRejectedError):
+        agent.post_message(_RUN_ID, _ACTOR, "Update missing param")
+    assert agent.get_thread(_RUN_ID)["messages"] == []
+
+
+# §7 — atomic approval: downstream failure rolls back, marks Failed ------------
+
+
+def test_approval_failure_rolls_back_and_marks_failed(
+    agent, fake_agent_model, seeded_run, monkeypatch, application
+):
+    fake_agent_model.queue(_turn("Adding it.", _ADD_PARAMETER))
+    proposal_id = agent.post_message(_RUN_ID, _ACTOR, "Add temperature")[
+        "pendingProposals"
+    ][0]["id"]
+
+    def _boom(*_args, **_kwargs):
+        raise ServiceError("simulated downstream failure")
+
+    monkeypatch.setattr(application, "save_design_space", _boom)
+
+    with pytest.raises(ServiceError):
+        agent.approve_proposal(_RUN_ID, proposal_id, _ACTOR)
+
+    # Campaign is untouched and the proposal is Failed, never Pending-with-mutation.
+    assert _param_count(seeded_run) == 2
+    proposal = seeded_run.get_agent_proposal(proposal_id)
+    assert proposal.status is AgentProposalStatus.FAILED
+    assert proposal.error
+
+
+# §4 — state gating at proposal creation ---------------------------------------
+
+
+def test_generate_rejected_before_validation(agent, fake_agent_model):
+    fake_agent_model.queue(_turn("Generating.", _GENERATE))
+    with pytest.raises(AgentActionRejectedError):
+        agent.post_message(_RUN_ID, _ACTOR, "Generate")
+
+
+def test_validate_rejected_when_already_validated(
+    agent, fake_agent_model, application
+):
+    application.validate_design_space(_RUN_ID, _ACTOR)
+    fake_agent_model.queue(_turn("Validate again.", _VALIDATE))
+    with pytest.raises(AgentActionRejectedError):
+        agent.post_message(_RUN_ID, _ACTOR, "Validate")
+
+
+def test_validate_and_generate_rejected_after_batch(
+    agent, fake_agent_model, application
+):
+    application.validate_design_space(_RUN_ID, _ACTOR)
+    application.generate_initial_design(_RUN_ID, _ACTOR)
+
+    fake_agent_model.queue(_turn("Validate.", _VALIDATE))
+    with pytest.raises(AgentActionRejectedError):
+        agent.post_message(_RUN_ID, _ACTOR, "Validate")
+
+    fake_agent_model.queue(_turn("Generate.", _GENERATE))
+    with pytest.raises(AgentActionRejectedError):
+        agent.post_message(_RUN_ID, _ACTOR, "Generate")
+
+
+# §5 — approving validate surfaces the real result -----------------------------
+
+
+def test_approve_validate_returns_passing_result(agent, fake_agent_model):
+    fake_agent_model.queue(_turn("Validate please.", _VALIDATE))
+    proposal_id = agent.post_message(_RUN_ID, _ACTOR, "Validate")[
+        "pendingProposals"
+    ][0]["id"]
+
+    result = agent.approve_proposal(_RUN_ID, proposal_id, _ACTOR)
+    assert result["initialDesign"] is None
+    assert result["validationResult"] is not None
+    assert result["validationResult"]["ok"] is True
+
+
+def test_approve_validate_returns_failing_result(
+    repo, fake_agent_model, make_run, make_definition, make_revision
+):
+    # A run whose revision has unconfirmed constraints fails validation but the
+    # proposal is still Approved: "approved" is not "validation passed".
+    with repo.transaction():
+        repo.add_definition(make_definition())
+        repo.add_revision(make_revision(constraints_confirmed=False))
+        repo.add_run(make_run())
+    application = ApplicationService(repo)
+    agent = AgentService(
+        repo, fake_agent_model, application, RunQueryService(repo)
+    )
+
+    fake_agent_model.queue(_turn("Validate please.", _VALIDATE))
+    proposal_id = agent.post_message(_RUN_ID, _ACTOR, "Validate")[
+        "pendingProposals"
+    ][0]["id"]
+    result = agent.approve_proposal(_RUN_ID, proposal_id, _ACTOR)
+
+    assert result["proposal"]["status"] == "Approved"
+    assert result["validationResult"]["ok"] is False
+    assert result["validationResult"]["issues"]
+    assert repo.get_run(_RUN_ID).status is RunStatus.DRAFT
+
+
+# §3 — recommendations context is sourced from persisted data ------------------
+
+
+def test_context_includes_real_persisted_candidate(
+    agent, fake_agent_model, application
+):
+    application.validate_design_space(_RUN_ID, _ACTOR)
+    batch = application.generate_initial_design(_RUN_ID, _ACTOR)
+
+    fake_agent_model.queue(_turn("Here is what the batch shows."))
+    agent.post_message(_RUN_ID, _ACTOR, "Explain the recommendations")
+
+    system_prompt = fake_agent_model.calls[-1][0]
+    assert batch.candidates[0].id in system_prompt
+    # Initial-design candidates carry no model prediction.
+    assert "尚无模型预测" in system_prompt
+    # The batch id is real, drawn from persistence, not fabricated by the model.
+    assert batch.id in system_prompt
+
+
+# §9 — model history is bounded ------------------------------------------------
+
+
+def test_model_history_is_capped(agent, fake_agent_model):
+    from backend.agent.service import _MAX_HISTORY_MESSAGES
+
+    for i in range(_MAX_HISTORY_MESSAGES + 5):
+        fake_agent_model.queue(_turn(f"reply {i}"))
+        agent.post_message(_RUN_ID, _ACTOR, f"message {i}")
+
+    last_history = fake_agent_model.calls[-1][1]
+    assert len(last_history) <= _MAX_HISTORY_MESSAGES
+    # The full transcript is still retained in SQLite.
+    assert len(agent.get_thread(_RUN_ID)["messages"]) == 2 * (
+        _MAX_HISTORY_MESSAGES + 5
+    )

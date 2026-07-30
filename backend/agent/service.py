@@ -31,6 +31,7 @@ from backend.agent.contract import (
 )
 from backend.agent.errors import (
     AgentActionRejectedError,
+    AgentInvalidActionError,
     AgentNotConfiguredError,
     InvalidAgentOutputError,
     StaleAgentProposalError,
@@ -44,6 +45,7 @@ from backend.application import (
     EntityNotFoundError,
     ServiceError,
 )
+from backend.domain.validation import StateTransitionError
 from backend.domain.models import (
     AgentMessage,
     AgentMessageRole,
@@ -61,6 +63,9 @@ if TYPE_CHECKING:
 
 _EDITABLE_STATUSES = {RunStatus.DRAFT, RunStatus.DESIGN_SPACE_VALIDATED}
 """Run states in which the design space may still be modified (§3.6)."""
+
+_MAX_HISTORY_MESSAGES = 20
+"""How many recent turns are sent to the model; the full thread stays in SQLite."""
 
 _ACTION_ADAPTER: TypeAdapter[AgentAction] = TypeAdapter(AgentAction)
 """Reconstructs a stored proposal payload back into a typed action."""
@@ -128,17 +133,24 @@ class AgentService:
     def post_message(self, run_id: str, actor: str, text: str) -> dict[str, Any]:
         """Record a user message, get one model turn, and stage any proposal.
 
-        This never mutates the campaign. If the model proposes a design-space
-        patch, its references are validated against the current revision and a
-        modification is refused when the run is lifecycle-frozen; a valid action
-        becomes a Pending proposal pinned to the current revision.
+        The turn is **atomic** (§6): nothing is written before the model call,
+        and the model is called outside any transaction. After the reply is
+        parsed the proposed action is state-gated and dry-run, and the run is
+        re-read to confirm its revision did not change during the (slow) model
+        call. Only then, in a *single* transaction, are the thread, the user
+        message, the assistant message, and any Pending proposal persisted — so a
+        model timeout, invalid JSON, invalid action, or a concurrent edit leaves
+        no orphaned message or proposal behind.
 
         Raises:
             AgentNotConfiguredError: If no model is configured.
+            AgentDependencyMissingError: If the optional SDK is not installed.
             EntityNotFoundError: If the run does not exist.
             InvalidAgentOutputError: If the model output is not a valid turn.
+            AgentInvalidActionError: If the action carries an invalid domain value.
             AgentActionRejectedError: If the proposed action is illegal for the
-                run's current state (frozen modification / unknown entity id).
+                run's current state (wrong lifecycle state / unknown entity id).
+            StaleAgentProposalError: If the run was edited during the model call.
         """
         if self._model is None:
             raise AgentNotConfiguredError(
@@ -150,38 +162,79 @@ class AgentService:
 
         run = self._query.require_run(run_id)
         revision = self._require_revision(run)
-        thread = self._ensure_thread(run_id)
 
-        self._repo.add_agent_message(
-            AgentMessage(
-                id=_new_id(),
-                thread_id=thread.id,
-                role=AgentMessageRole.USER,
-                content=message,
-                created_at=_now(),
-            )
+        # Build the model input from persisted history plus the new user message,
+        # held only in memory; nothing is written yet.
+        existing_thread = self._repo.get_thread_for_run(run_id)
+        prior = (
+            self._repo.list_agent_messages(existing_thread.id)
+            if existing_thread is not None
+            else []
+        )
+        history = [{"role": item.role.value, "content": item.content} for item in prior]
+        history.append({"role": "user", "content": message})
+        history = history[-_MAX_HISTORY_MESSAGES:]
+
+        batches = self._repo.list_batches(run_id)
+        latest_batch = batches[-1] if batches else None
+        experiment_runs = (
+            self._repo.list_experiment_runs_for_run(run_id) if latest_batch else []
+        )
+        system = (
+            SYSTEM_PROMPT
+            + "\n\n"
+            + build_context_message(run, revision, latest_batch, experiment_runs)
         )
 
-        history = [
-            {"role": item.role.value, "content": item.content}
-            for item in self._repo.list_agent_messages(thread.id)
-        ]
-        system = SYSTEM_PROMPT + "\n\n" + build_context_message(run, revision)
+        # The slow, side-effect-free model call happens with no write lock held.
         raw = self._model.generate(system, history)
         turn = self._parse_turn(raw)
 
-        self._repo.add_agent_message(
-            AgentMessage(
-                id=_new_id(),
-                thread_id=thread.id,
-                role=AgentMessageRole.ASSISTANT,
-                content=turn.message,
-                created_at=_now(),
-            )
-        )
-
+        # Validate any proposed action before writing anything (§4/§6).
         if turn.proposed_action is not None:
-            self._stage_proposal(run, revision, thread, turn.proposed_action)
+            self._validate_action(run, revision, turn.proposed_action)
+
+        # Confirm the design space did not move under us during the model call.
+        fresh_run = self._query.require_run(run_id)
+        if fresh_run.definition_revision_id != run.definition_revision_id:
+            raise StaleAgentProposalError(
+                "The campaign was edited while the agent was responding; "
+                "re-send the message to work against the current design space."
+            )
+
+        with self._repo.transaction():
+            thread = self._ensure_thread(run_id)
+            self._repo.add_agent_message(
+                AgentMessage(
+                    id=_new_id(),
+                    thread_id=thread.id,
+                    role=AgentMessageRole.USER,
+                    content=message,
+                    created_at=_now(),
+                )
+            )
+            self._repo.add_agent_message(
+                AgentMessage(
+                    id=_new_id(),
+                    thread_id=thread.id,
+                    role=AgentMessageRole.ASSISTANT,
+                    content=turn.message,
+                    created_at=_now(),
+                )
+            )
+            if turn.proposed_action is not None:
+                self._repo.add_agent_proposal(
+                    AgentProposal(
+                        id=_new_id(),
+                        thread_id=thread.id,
+                        campaign_run_id=run.id,
+                        kind=turn.proposed_action.kind,
+                        payload=turn.proposed_action.model_dump(by_alias=True),
+                        status=AgentProposalStatus.PENDING,
+                        base_revision_id=run.definition_revision_id,
+                        created_at=_now(),
+                    )
+                )
 
         return self.get_thread(run_id)
 
@@ -192,11 +245,20 @@ class AgentService:
     ) -> dict[str, Any]:
         """Approve a Pending proposal and dispatch it to the existing service.
 
+        The dispatch and the proposal's move to Approved happen in **one** outer
+        transaction (§7): the ``ApplicationService``'s own transaction joins it,
+        so the campaign write and the proposal update commit or roll back
+        together. If dispatch fails the outer transaction rolls the campaign
+        change back, and only then is the proposal marked Failed in a *separate*
+        transaction — the campaign is never left mutated while the proposal
+        stays Pending. A stale or illegal proposal is rejected before any write,
+        leaving it Pending so it can still be rejected by the user.
+
         Raises:
             EntityNotFoundError: If the run or proposal does not exist.
-            AgentActionRejectedError: If the proposal is not Pending, or a
-                modification is proposed against a frozen run, or the underlying
-                action is illegal.
+            AgentActionRejectedError: If the proposal is not Pending, or the
+                action is illegal for the run's current state.
+            AgentInvalidActionError: If the action carries an invalid domain value.
             StaleAgentProposalError: If the campaign changed since the proposal
                 was created (its pinned revision no longer matches the run).
         """
@@ -212,19 +274,30 @@ class AgentService:
                 "re-run the agent to propose against the current design space."
             )
         action = _ACTION_ADAPTER.validate_python(dict(proposal.payload))
+        # Re-check state gates against the live run; on failure the proposal is
+        # left Pending (nothing written) so the user can still reject it.
+        self._reject_illegal_action(run, action)
 
-        initial_design: dict[str, Any] | None = None
         try:
-            initial_design = self._dispatch(run, actor, action)
-        except (ServiceError, AgentActionRejectedError) as exc:
+            with self._repo.transaction():
+                initial_design, validation_result = self._dispatch(run, actor, action)
+                self._resolve(proposal, AgentProposalStatus.APPROVED)
+        except (
+            ServiceError,
+            StateTransitionError,
+            AgentActionRejectedError,
+            AgentInvalidActionError,
+        ) as exc:
+            # The outer transaction rolled the campaign change back; record the
+            # failure on the proposal in its own transaction.
             self._resolve(proposal, AgentProposalStatus.FAILED, error=str(exc))
             raise
 
-        self._resolve(proposal, AgentProposalStatus.APPROVED)
         return {
             "proposal": _dump(self._repo.get_agent_proposal(proposal_id)),
             "view": self._query.run_view(run_id),
             "initialDesign": initial_design,
+            "validationResult": validation_result,
         }
 
     def reject_proposal(
@@ -248,23 +321,33 @@ class AgentService:
 
     def _dispatch(
         self, run: CampaignRun, actor: str, action: AgentAction
-    ) -> dict[str, Any] | None:
-        """Apply an approved action via the existing service; return any extra view."""
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Apply an approved action via the existing service.
+
+        Returns a ``(initialDesign, validationResult)`` pair: at most one side is
+        populated (a patch populates neither, generate the first, validate the
+        second), so the caller can surface a real validation outcome (§5) instead
+        of equating "approved" with "validation passed".
+        """
         if isinstance(action, DesignSpacePatchAction):
-            self._reject_if_frozen(run)
             revision = self._require_revision(run)
             update = self._build_update(run, revision, action)
             self._application.save_design_space(run.id, actor, update)
-            return None
+            return None, None
         if isinstance(action, ValidateDesignSpaceAction):
-            self._application.validate_design_space(run.id, actor)
-            return None
+            result = self._application.validate_design_space(run.id, actor)
+            return None, self._validation_view(result)
         if isinstance(action, GenerateInitialDesignAction):
             batch = self._application.generate_initial_design(run.id, actor)
-            return self._query.initial_design_view(run.id, batch)
+            return self._query.initial_design_view(run.id, batch), None
         raise AgentActionRejectedError(  # pragma: no cover - union is exhaustive
             "Unsupported agent action."
         )
+
+    @staticmethod
+    def _validation_view(result: Any) -> dict[str, Any]:
+        """Shape a :class:`ValidationResult` like the ``/validate`` endpoint."""
+        return {"ok": result.ok, **result.model_dump(mode="json", by_alias=True)}
 
     def _build_update(
         self,
@@ -273,7 +356,7 @@ class AgentService:
         action: DesignSpacePatchAction,
     ) -> DesignSpaceUpdate:
         """Rebuild the full design space, preserving the agent-immutable policy."""
-        result = apply_patch(revision, action.patch)
+        result = self._apply_patch(revision, action.patch)
         policy = run.optimization_policy
         strategy = policy.strategy_config.model_copy(
             update={"acquisition_function": result.acquisition_function}
@@ -292,31 +375,75 @@ class AgentService:
             strategy_config=strategy,
         )
 
-    def _stage_proposal(
+    def _validate_action(
         self,
         run: CampaignRun,
         revision: CampaignDefinitionRevision,
-        thread: AgentThread,
         action: AgentAction,
     ) -> None:
-        """Validate a proposed action and persist it as Pending (never applied)."""
+        """Reject an action illegal for the run's state, and dry-run a patch.
+
+        Never writes anything. State gating (§4) is applied to every action; a
+        design-space patch is additionally dry-run so an unknown-id or
+        invalid-value op is rejected now rather than surfacing only on approval.
+        """
+        self._reject_illegal_action(run, action)
         if isinstance(action, DesignSpacePatchAction):
-            self._reject_if_frozen(run)
-            # Dry-run the patch so an unknown-id or structurally impossible op is
-            # rejected at proposal time rather than surfacing only on approval.
-            apply_patch(revision, action.patch)
-        self._repo.add_agent_proposal(
-            AgentProposal(
-                id=_new_id(),
-                thread_id=thread.id,
-                campaign_run_id=run.id,
-                kind=action.kind,
-                payload=action.model_dump(by_alias=True),
-                status=AgentProposalStatus.PENDING,
-                base_revision_id=run.definition_revision_id,
-                created_at=_now(),
-            )
-        )
+            self._apply_patch(revision, action.patch)
+
+    def _reject_illegal_action(self, run: CampaignRun, action: AgentAction) -> None:
+        """Deterministically forbid an action illegal for the run's state (§4).
+
+        Only ``Draft``/``DesignSpaceValidated`` runs with no batch may be patched;
+        validation is offered only from ``Draft``; an initial design may be
+        generated only from ``DesignSpaceValidated`` with no batch. Every later
+        state (``RecommendationsPending`` onward) allows conversation only.
+        """
+        if isinstance(action, DesignSpacePatchAction):
+            if run.status not in _EDITABLE_STATUSES:
+                raise AgentActionRejectedError(
+                    f"The design space is frozen in state {run.status.value!r}; "
+                    "the agent cannot modify it after an initial design exists."
+                )
+            if self._repo.list_batches(run.id):
+                raise AgentActionRejectedError(
+                    "The design space is frozen once a recommendation batch "
+                    "exists; the agent cannot modify it."
+                )
+        elif isinstance(action, ValidateDesignSpaceAction):
+            if run.status is not RunStatus.DRAFT:
+                raise AgentActionRejectedError(
+                    f"Validation is only available for a Draft run, not "
+                    f"{run.status.value!r}."
+                )
+        elif isinstance(action, GenerateInitialDesignAction):
+            if run.status is not RunStatus.DESIGN_SPACE_VALIDATED:
+                raise AgentActionRejectedError(
+                    "An initial design can only be generated from a validated "
+                    f"design space, not from {run.status.value!r}."
+                )
+            if self._repo.list_batches(run.id):
+                raise AgentActionRejectedError(
+                    "An initial design has already been generated for this run."
+                )
+
+    @staticmethod
+    def _apply_patch(revision: CampaignDefinitionRevision, op: Any) -> Any:
+        """Apply a patch, mapping a domain ``ValidationError`` to a stable code.
+
+        ``apply_patch`` builds real domain objects, so a model-proposed value the
+        contract could not reject (e.g. ``lowerBound >= upperBound`` or an empty
+        categorical set) raises a pydantic ``ValidationError`` here; it is
+        surfaced as :class:`AgentInvalidActionError` (AGENT_INVALID_ACTION) rather
+        than a generic request validation error.
+        """
+        try:
+            return apply_patch(revision, op)
+        except ValidationError as exc:
+            raise AgentInvalidActionError(
+                "The proposed change contains an invalid value and cannot be "
+                "applied."
+            ) from exc
 
     def _resolve(
         self,
@@ -365,15 +492,6 @@ class AgentService:
                 f"Unknown proposal {proposal_id!r} for run {run_id!r}."
             )
         return proposal
-
-    @staticmethod
-    def _reject_if_frozen(run: CampaignRun) -> None:
-        """Refuse a design-space modification once the run's lifecycle has advanced."""
-        if run.status not in _EDITABLE_STATUSES:
-            raise AgentActionRejectedError(
-                f"The design space is frozen in state {run.status.value!r}; the "
-                "agent cannot modify it after an initial design exists."
-            )
 
     @staticmethod
     def _parse_turn(raw: str) -> AgentTurn:

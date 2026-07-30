@@ -154,13 +154,6 @@ export default function MainWorkspace({
                   >
                     No fixed-sum constraint
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => onChooseConstraint('custom')}
-                    className="rounded border border-slate-300 bg-white px-3 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50"
-                  >
-                    Specify another constraint
-                  </button>
                 </div>
               )}
             </>

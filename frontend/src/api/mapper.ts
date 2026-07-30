@@ -1,9 +1,9 @@
 // UI <-> server DTO conversion for the design space.
 //
 // All field conversion lives here so React components never reshape data. The
-// mapper refuses to silently drop information: a custom constraint expression
-// or a non-numeric discrete level throws `MappingError` rather than producing a
-// body the server would misinterpret.
+// mapper refuses to silently drop information: a non-numeric discrete level
+// throws `MappingError` rather than producing a body the server would
+// misinterpret.
 
 import type {
   Objective,
@@ -178,11 +178,6 @@ function constraintArtifacts(
   parameters: Parameter[],
 ): { constraints: ConstraintSpecInput[]; constraintsConfirmed: boolean } {
   switch (constraint.choice) {
-    case 'custom':
-      throw new MappingError(
-        'Custom constraint expressions are not supported yet and cannot be submitted. ' +
-          'Choose the fixed-sum or no-constraint option instead.',
-      )
     case 'fixed-sum': {
       const parameterIds = fixedSumParameterIds(parameters)
       return {
@@ -398,13 +393,12 @@ function hydrateConstraint(
   parameters: Parameter[],
 ): ConstraintState {
   if (constraints.length === 0) {
-    return { choice: confirmed ? 'no-constraint' : null, customExpression: '' }
+    return { choice: confirmed ? 'no-constraint' : null }
   }
   if (constraints.length === 1 && confirmed && isStandardFixedSum(constraints[0], parameters)) {
     const only = constraints[0] as LinearEqualityConstraintDto
     return {
       choice: 'fixed-sum',
-      customExpression: '',
       constraintId: only.id,
       resolvedAt: only.resolvedAt,
     }
@@ -412,7 +406,7 @@ function hydrateConstraint(
   // Anything else is unsupported. Leave the choice unresolved rather than
   // mislabelling it as no-constraint; the page blocks editing via the
   // unsupported banner (see assessSupport).
-  return { choice: null, customExpression: '' }
+  return { choice: null }
 }
 
 // Detect any loaded configuration this stage cannot represent. Returning a

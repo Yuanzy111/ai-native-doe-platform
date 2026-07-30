@@ -18,7 +18,9 @@ from __future__ import annotations
 import os
 from typing import Protocol, runtime_checkable
 
-from backend.agent.errors import AgentModelError
+from typing import Any
+
+from backend.agent.errors import AgentDependencyMissingError, AgentModelError
 
 
 @runtime_checkable
@@ -38,29 +40,46 @@ class AgentModel(Protocol):
 class OpenAICompatibleAgentModel:
     """An :class:`AgentModel` backed by any OpenAI-compatible chat endpoint.
 
-    Configured entirely from ``base_url``/``api_key``/``model``; the SDK is
-    imported lazily so importing this module never requires the optional
-    ``openai`` dependency. JSON output is requested via ``response_format`` and
-    the response text is returned verbatim.
+    Configured entirely from ``base_url``/``api_key``/``model``. Construction
+    stores config only — the ``openai`` SDK is neither imported nor a client
+    built until the first :meth:`generate`, so an app whose ``AGENT_*`` env is
+    set but whose optional ``agent`` extra is not installed still boots; the
+    missing dependency surfaces as :class:`AgentDependencyMissingError` only when
+    a message is actually sent. JSON output is requested via ``response_format``
+    and the response text is returned verbatim.
     """
 
     def __init__(self, *, base_url: str, api_key: str, model: str) -> None:
-        try:
-            from openai import OpenAI
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise AgentModelError(
-                "The 'openai' package is required for the agent model; install "
-                "the optional 'agent' extra."
-            ) from exc
+        self._base_url = base_url
+        self._api_key = api_key
         self._model = model
-        self._client = OpenAI(base_url=base_url, api_key=api_key)
+        self._client: Any | None = None
+
+    def _get_client(self) -> Any:
+        """Lazily build and cache the OpenAI client on first use.
+
+        Raises:
+            AgentDependencyMissingError: If the optional ``openai`` package is
+                not installed.
+        """
+        if self._client is None:
+            try:
+                from openai import OpenAI
+            except ImportError as exc:
+                raise AgentDependencyMissingError(
+                    "The 'openai' package is required for the agent model; "
+                    "install the optional 'agent' extra."
+                ) from exc
+            self._client = OpenAI(base_url=self._base_url, api_key=self._api_key)
+        return self._client
 
     def generate(self, system_prompt: str, messages: list[dict[str, str]]) -> str:
+        client = self._get_client()
         from openai import OpenAIError
 
         payload = [{"role": "system", "content": system_prompt}, *messages]
         try:
-            response = self._client.chat.completions.create(
+            response = client.chat.completions.create(
                 model=self._model,
                 messages=payload,  # type: ignore[arg-type]
                 response_format={"type": "json_object"},
