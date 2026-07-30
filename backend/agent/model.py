@@ -22,6 +22,13 @@ from typing import Any
 
 from backend.agent.errors import AgentDependencyMissingError, AgentModelError
 
+# A real chat completion may take tens of seconds; cap it so a hung provider
+# cannot block a request thread indefinitely. The SDK retries a *bounded* number
+# of times on transient failures (connection error, 408/409/429, >=500) — one
+# extra attempt, not an unbounded loop — before surfacing a stable AgentModelError.
+_REQUEST_TIMEOUT_SECONDS = 45.0
+_MAX_RETRIES = 1
+
 
 @runtime_checkable
 class AgentModel(Protocol):
@@ -70,7 +77,12 @@ class OpenAICompatibleAgentModel:
                     "The 'openai' package is required for the agent model; "
                     "install the optional 'agent' extra."
                 ) from exc
-            self._client = OpenAI(base_url=self._base_url, api_key=self._api_key)
+            self._client = OpenAI(
+                base_url=self._base_url,
+                api_key=self._api_key,
+                timeout=_REQUEST_TIMEOUT_SECONDS,
+                max_retries=_MAX_RETRIES,
+            )
         return self._client
 
     def generate(self, system_prompt: str, messages: list[dict[str, str]]) -> str:

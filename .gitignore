@@ -24,6 +24,9 @@ build/
 logs/
 .cache/
 
+# Local demo / dev database
+data/
+
 # OS / editor
 .DS_Store
 Thumbs.db
